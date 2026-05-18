@@ -101,7 +101,7 @@ STANDARD_CHANNELS = ['F3', 'C3', 'O1', 'F4', 'C4', 'O2']  # искомые ст�
 
 # ========== API ====================
 DEFAULT_API_URL = "https://med.smed96.synology.me/psgapp/api/"
-DEFAULT_TOKEN = "9de45892a4825c55f3965a08fb0963db36f4796bb9a64c6779942d0c2a559873"
+DEFAULT_TOKEN = ""
 TIMEOUT = 90   # таймаут для обычных запросов (сек)
 MAX_RETRIES = 3
 PAGE_SIZE = 2000
