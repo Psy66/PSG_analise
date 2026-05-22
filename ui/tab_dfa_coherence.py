@@ -17,10 +17,12 @@ matplotlib.use('TkAgg')
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
+import mne
+from mne.viz import plot_topomap, plot_sensors
+from mne.channels import make_standard_montage
 
 from ui.base_tab import BaseTab
 from core.api_client import get_epochs
-from core.config import DEFAULT_API_URL, DEFAULT_TOKEN
 
 # Константы
 DFA_CHANNELS = ['F3', 'C3', 'O1', 'F4', 'C4', 'O2']
@@ -31,6 +33,24 @@ COH_PAIRS = [
 ]
 COH_BANDS = ['delta', 'theta', 'alpha', 'sigma', 'beta', 'gamma']
 
+# Позиции электродов для топографической карты (система 10-20)
+CHANNEL_POS = {
+    'F3': (-0.5, 0.8), 'F4': (0.5, 0.8),
+    'C3': (-0.5, 0.4), 'C4': (0.5, 0.4),
+    'O1': (-0.3, 0.0), 'O2': (0.3, 0.0),
+}
+# Дополнительные позиции для центров (можно использовать стандартный montage из mne)
+def get_montage():
+    montage = make_standard_montage('standard_1020')
+    # выберем только нужные каналы
+    ch_names = DFA_CHANNELS
+    pos = {ch: montage.get_positions()['ch_pos'][ch][:2] for ch in ch_names if ch in montage.get_positions()['ch_pos']}
+    # для отсутствующих зададим приблизительно
+    if 'O1' not in pos:
+        pos['O1'] = (-0.3, -0.1)
+    if 'O2' not in pos:
+        pos['O2'] = (0.3, -0.1)
+    return pos
 
 class DfaCoherenceTab(BaseTab):
     def __init__(self, parent, main_app):
@@ -44,19 +64,19 @@ class DfaCoherenceTab(BaseTab):
         self.include_stage = tk.BooleanVar(value=True)
         self.fdr_threshold = tk.DoubleVar(value=0.05)
         self.exclude_central_mixed = tk.BooleanVar(value=True)
-
-        # Выбор каналов/пар/диапазонов
+        
+        # Для выбора в UI
         self.selected_dfa_channels = []
         self.selected_coh_pairs = []
         self.selected_coh_bands = []
-
+        
         # Данные и результаты
         self.epochs_df = None
         self.filtered_study_ids = None
         self.results_df = None          # DataFrame с beta, p_value, q_value...
         self.current_figure = None
         self.stop_flag = False
-
+        
         # Для диагностики и бутстрапа
         self.diag_model = None
         self.diag_feature_name = ""
@@ -64,68 +84,70 @@ class DfaCoherenceTab(BaseTab):
         self.bootstrap_results = None
         self.all_diagnostics = []       # список dict для отчёта
         self.normality_results = {}     # {feature: shapiro_p}
-
+        
+        # Для топографических карт
+        self.dfa_group_means = None     # dict {severity: array of DFA per channel}
+        self.coherence_matrix = None    # матрица когерентности для выбранного диапазона (средняя по группам)
+        
         self._create_widgets()
 
     # ------------------------------------------------------------
-    # Построение интерфейса (аналогично LMM)
+    # Построение интерфейса
     # ------------------------------------------------------------
     def _create_widgets(self):
         main_container = ttk.Frame(self)
         main_container.pack(fill=tk.BOTH, expand=True)
-
-        # Прокрутка всей левой панели (содержимое может быть большим)
+        
+        # Прокрутка левой панели
         canvas = tk.Canvas(main_container, borderwidth=0, highlightthickness=0)
         scrollbar = ttk.Scrollbar(main_container, orient=tk.VERTICAL, command=canvas.yview)
         canvas.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
+        
         inner = ttk.Frame(canvas)
         canvas.create_window((0, 0), window=inner, anchor="nw")
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-
+        
         paned = ttk.PanedWindow(inner, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
-
+        
         left_frame = ttk.Frame(paned)
         paned.add(left_frame, weight=1)
         right_frame = ttk.Frame(paned)
         paned.add(right_frame, weight=2)
-
+        
         # ========== ЛЕВАЯ ПАНЕЛЬ ==========
-        # --- Источник данных и описание ---
+        # --- Источник и описание ---
         info_frame = ttk.LabelFrame(left_frame, text="Источник данных", padding=5)
         info_frame.pack(fill=tk.X, padx=5, pady=5)
         ttk.Label(info_frame, text="Используются отфильтрованные данные из вкладки 'Загрузка'",
                   foreground="blue").pack(anchor=tk.W)
         ttk.Label(info_frame, text="(токен и URL не требуются)").pack(anchor=tk.W)
-
-        desc_frame = ttk.LabelFrame(left_frame, text="Что такое DFA и когерентность?", padding=5)
+        
+        desc_frame = ttk.LabelFrame(left_frame, text="DFA и когерентность (Глава 2, п. 2.4.4–2.4.5, 2.5.7)", padding=5)
         desc_frame.pack(fill=tk.X, padx=5, pady=5)
         desc_text = (
-            "DFA (детрендовый флуктуационный анализ) оценивает долговременную корреляцию сигнала: "
-            "показатель α > 0.5 указывает на персистентность. Когерентность измеряет линейную связь между "
-            "двумя отведениями в различных частотных диапазонах. Линейные смешанные модели (LMM) выявляют "
-            "значимые различия этих показателей между эпохами с апноэ и без, с учётом возраста, пола, ИМТ и "
-            "стадии сна, а также индивидуальных различий пациентов."
+            "DFA (детрендовый флуктуационный анализ) оценивает долговременную корреляцию: α>0.5 – персистентность. "
+            "Когерентность – мера линейной связи между отведениями в разных частотных диапазонах. "
+            "Линейные смешанные модели (LMM) выявляют значимые различия этих показателей между эпохами с апноэ и без, "
+            "с поправкой на возраст, пол, ИМТ и стадию сна, а также случайный перехват пациента. "
+            "Топографические карты визуализируют пространственное распределение DFA и когерентности."
         )
         ttk.Label(desc_frame, text=desc_text, justify=tk.LEFT, wraplength=600).pack(anchor=tk.W, fill=tk.X, padx=5, pady=2)
         ttk.Button(desc_frame, text="Показать инструкцию", command=self.show_instructions).pack(anchor=tk.W, padx=5, pady=2)
-
-        # --- Общие настройки данных ---
+        
+        # --- Данные ---
         data_frame = ttk.LabelFrame(left_frame, text="Данные", padding=5)
         data_frame.pack(fill=tk.X, padx=5, pady=5)
         ttk.Label(data_frame, text="Тип набора эпох:").grid(row=0, column=0, sticky=tk.W)
         self.data_type_combo = ttk.Combobox(data_frame, textvariable=self.data_type, values=[1,2,3], state='readonly', width=5)
         self.data_type_combo.grid(row=0, column=1, padx=5)
         ttk.Label(data_frame, text="1=тонический, 2=все эпохи, 3=фильтр по положению").grid(row=0, column=2, sticky=tk.W)
-        ttk.Checkbutton(data_frame, text="Использовать отфильтрованные исследования",
-                        variable=self.use_filtered).grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=5)
+        ttk.Checkbutton(data_frame, text="Использовать отфильтрованные исследования", variable=self.use_filtered).grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=5)
         ttk.Checkbutton(data_frame, text="Использовать кэш API", variable=self.use_cache).grid(row=2, column=0, columnspan=3, sticky=tk.W)
-        ttk.Checkbutton(data_frame, text="Исключить центральное/смешанное апноэ",
-                        variable=self.exclude_central_mixed).grid(row=3, column=0, columnspan=3, sticky=tk.W)
-
+        ttk.Checkbutton(data_frame, text="Исключить центральное/смешанное апноэ", variable=self.exclude_central_mixed).grid(row=3, column=0, columnspan=3, sticky=tk.W)
+        
         # --- Режим анализа ---
         mode_frame = ttk.LabelFrame(left_frame, text="Режим анализа", padding=5)
         mode_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -133,7 +155,9 @@ class DfaCoherenceTab(BaseTab):
                         value='lmm_dfa', command=self._toggle_mode).pack(anchor=tk.W)
         ttk.Radiobutton(mode_frame, text="LMM для когерентности", variable=self.analysis_mode,
                         value='lmm_coh', command=self._toggle_mode).pack(anchor=tk.W)
-
+        ttk.Radiobutton(mode_frame, text="Топографические карты", variable=self.analysis_mode,
+                        value='topo', command=self._toggle_mode).pack(anchor=tk.W)
+        
         # --- Выбор каналов/пар (скрываемые панели) ---
         self.dfa_select_frame = ttk.LabelFrame(left_frame, text="Выбор каналов DFA", padding=5)
         self.dfa_listbox = tk.Listbox(self.dfa_select_frame, selectmode=tk.EXTENDED, height=6, width=20)
@@ -141,7 +165,7 @@ class DfaCoherenceTab(BaseTab):
             self.dfa_listbox.insert(tk.END, ch)
         self.dfa_listbox.selection_set(0, tk.END)
         self.dfa_listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
+        
         self.coh_select_frame = ttk.LabelFrame(left_frame, text="Выбор пар и диапазонов", padding=5)
         ttk.Label(self.coh_select_frame, text="Пары отведений:").pack(anchor=tk.W)
         self.pairs_listbox = tk.Listbox(self.coh_select_frame, selectmode=tk.EXTENDED, height=5)
@@ -155,21 +179,18 @@ class DfaCoherenceTab(BaseTab):
             self.bands_listbox.insert(tk.END, b)
         self.bands_listbox.selection_set(0, tk.END)
         self.bands_listbox.pack(fill=tk.X, padx=5, pady=2)
-
+        
         # --- Параметры LMM ---
         lmm_frame = ttk.LabelFrame(left_frame, text="Параметры LMM", padding=5)
         lmm_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Checkbutton(lmm_frame, text="Включить ковариаты (возраст, пол, ИМТ)",
-                        variable=self.include_covariates).pack(anchor=tk.W)
-        ttk.Checkbutton(lmm_frame, text="Включить стадию сна (N2/N3) как фактор",
-                        variable=self.include_stage).pack(anchor=tk.W)
+        ttk.Checkbutton(lmm_frame, text="Включить ковариаты (возраст, пол, ИМТ)", variable=self.include_covariates).pack(anchor=tk.W)
+        ttk.Checkbutton(lmm_frame, text="Включить стадию сна (N2/N3) как фактор", variable=self.include_stage).pack(anchor=tk.W)
         ttk.Label(lmm_frame, text="Порог FDR (q):").pack(anchor=tk.W)
         ttk.Entry(lmm_frame, textvariable=self.fdr_threshold, width=6).pack(anchor=tk.W)
-
+        
         # --- Диагностика и бутстрап ---
         diag_frame = ttk.LabelFrame(left_frame, text="Диагностика модели", padding=5)
         diag_frame.pack(fill=tk.X, padx=5, pady=5)
-        # Выбор признака для диагностики (заполнится после анализа)
         ttk.Label(diag_frame, text="Признак для диагностики:").pack(anchor=tk.W)
         self.diag_feature_combo = ttk.Combobox(diag_frame, state='readonly', width=30)
         self.diag_feature_combo.pack(fill=tk.X, padx=5, pady=2)
@@ -179,11 +200,11 @@ class DfaCoherenceTab(BaseTab):
         self.bootstrap_btn.pack(anchor=tk.W, pady=2)
         self.save_diag_btn = ttk.Button(diag_frame, text="Сохранить диагностику (CSV)", command=self.save_diagnostics_csv, state=tk.DISABLED)
         self.save_diag_btn.pack(anchor=tk.W, pady=2)
-
-        # --- Кнопки управления ---
+        
+        # --- Кнопки ---
         btn_frame = ttk.Frame(left_frame)
         btn_frame.pack(fill=tk.X, padx=5, pady=10)
-        self.run_btn = ttk.Button(btn_frame, text="Запустить LMM", command=self.run_analysis)
+        self.run_btn = ttk.Button(btn_frame, text="Запустить анализ", command=self.run_analysis)
         self.run_btn.pack(side=tk.LEFT, padx=5)
         self.stop_btn = ttk.Button(btn_frame, text="Остановить", command=self.stop_analysis, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
@@ -193,11 +214,11 @@ class DfaCoherenceTab(BaseTab):
         self.save_plot_btn.pack(side=tk.LEFT, padx=5)
         self.report_btn = ttk.Button(btn_frame, text="Сформировать отчёт", command=self.generate_report, state=tk.DISABLED)
         self.report_btn.pack(side=tk.LEFT, padx=5)
-
+        
         # ========== ПРАВАЯ ПАНЕЛЬ: вкладки ==========
         self.notebook = ttk.Notebook(right_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
+        
         self.tab_table = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_table, text="Таблица результатов")
         self.tree = ttk.Treeview(self.tab_table)
@@ -205,19 +226,24 @@ class DfaCoherenceTab(BaseTab):
         vsb = ttk.Scrollbar(self.tab_table, orient="vertical", command=self.tree.yview)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.configure(yscrollcommand=vsb.set)
-
+        
         self.tab_plots = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_plots, text="Графики LMM")
         self.plot_frame = ttk.Frame(self.tab_plots)
         self.plot_frame.pack(fill=tk.BOTH, expand=True)
-
+        
+        self.tab_topo = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_topo, text="Топографические карты")
+        self.topo_frame = ttk.Frame(self.tab_topo)
+        self.topo_frame.pack(fill=tk.BOTH, expand=True)
+        
         self.tab_diag = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_diag, text="Диагностика модели")
         self.diag_text = tk.Text(self.tab_diag, wrap=tk.WORD, font=("Courier New", 9), height=8)
         self.diag_text.pack(fill=tk.X, padx=5, pady=5)
         self.diag_plot_frame = ttk.Frame(self.tab_diag)
         self.diag_plot_frame.pack(fill=tk.BOTH, expand=True)
-
+        
         self.tab_bootstrap = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_bootstrap, text="Бутстрап")
         self.bootstrap_tree_frame = ttk.Frame(self.tab_bootstrap)
@@ -232,14 +258,14 @@ class DfaCoherenceTab(BaseTab):
         sb_boot = ttk.Scrollbar(self.bootstrap_tree_frame, orient=tk.VERTICAL, command=self.bootstrap_tree.yview)
         sb_boot.pack(side=tk.RIGHT, fill=tk.Y)
         self.bootstrap_tree.configure(yscrollcommand=sb_boot.set)
-
+        
         self.tab_log = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_log, text="Лог")
         self.log_text = tk.Text(self.tab_log, wrap=tk.WORD, font=("Courier New", 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
-
+        
         self._toggle_mode()
-
+        
     def _toggle_mode(self):
         mode = self.analysis_mode.get()
         self.dfa_select_frame.pack_forget()
@@ -248,7 +274,11 @@ class DfaCoherenceTab(BaseTab):
             self.dfa_select_frame.pack(fill=tk.X, padx=5, pady=5)
         elif mode == 'lmm_coh':
             self.coh_select_frame.pack(fill=tk.X, padx=5, pady=5)
-
+        elif mode == 'topo':
+            # Для топографии не нужен выбор особый, можно показать DFA или когерентность
+            # Покажем простой выбор диапазона для когерентности
+            pass
+            
     # ------------------------------------------------------------
     # Вспомогательные методы
     # ------------------------------------------------------------
@@ -256,42 +286,39 @@ class DfaCoherenceTab(BaseTab):
         self.log_text.insert(tk.END, msg + "\n")
         self.log_text.see(tk.END)
         self.main_app.log(msg)
-
+        
     def stop_analysis(self):
         self.stop_flag = True
         self.log("Остановка анализа запрошена...")
-
+        
     def show_instructions(self):
         msg = (
-            "ИНСТРУКЦИЯ ПО АНАЛИЗУ DFA И КОГЕРЕНТНОСТИ\n"
-            "==========================================\n"
+            "ИНСТРУКЦИЯ ПО АНАЛИЗУ DFA И КОГЕРЕНТНОСТИ (Глава 2)\n"
+            "================================================\n"
             "1. Загрузите и отфильтруйте данные на вкладке 'Загрузка и фильтры'.\n"
-            "2. Выберите режим анализа (DFA или когерентность) и отметьте нужные каналы/пары.\n"
-            "3. Установите параметры LMM (включение ковариат, стадии сна, порог FDR).\n"
-            "4. Нажмите 'Запустить LMM'. Будут рассчитаны модели для всех комбинаций.\n"
-            "5. После завершения появятся таблица и графики (forest plot, volcano plot).\n"
-            "6. Выберите признак в выпадающем списке в разделе 'Диагностика модели' и нажмите\n"
-            "   'Диагностика остатков' – будут построены Q-Q plot и график остатков.\n"
-            "7. При нарушении допущений запустите бутстрап (1000 итераций) для робастных CI.\n"
-            "8. Кнопка 'Сформировать отчёт' создаст HTML-отчёт со всеми результатами.\n"
-            "9. Результаты можно сохранить в CSV (таблица) и PNG (графики)."
+            "2. Выберите режим анализа:\n"
+            "   - LMM для DFA: сравнение показателя α между эпохами с апноэ/без.\n"
+            "   - LMM для когерентности: сравнение связности в выбранных диапазонах.\n"
+            "   - Топографические карты: визуализация распределения DFA или когерентности.\n"
+            "3. Установите параметры LMM (ковариаты, стадия сна, порог FDR).\n"
+            "4. Нажмите 'Запустить анализ'. Появятся таблица результатов и графики (forest, volcano).\n"
+            "5. Для выбранного признака можно выполнить диагностику остатков и бутстрап.\n"
+            "6. Кнопка 'Сформировать отчёт' создаст HTML-отчёт с интерпретацией и топографическими картами.\n"
+            "7. Результаты можно сохранить в CSV и PNG."
         )
         messagebox.showinfo("Инструкция", msg)
-
+        
     # ------------------------------------------------------------
     # Загрузка данных
     # ------------------------------------------------------------
     def _load_epochs(self):
-        """Загружает эпохи через API, используя настройки из вкладки загрузки."""
-        # Берём API из вкладки загрузки
         load_tab = self.main_app.tabs['load']
         api_url = load_tab.api_url.get().rstrip('/')
         token = load_tab.token.get().strip()
         if not api_url or not token:
             self.log("Ошибка: не указаны URL или токен API. Перейдите на вкладку 'Загрузка'.")
             return None
-
-        # Определяем список study_ids
+            
         study_ids = None
         if self.use_filtered.get():
             filtered_df = self.main_app.get_filtered_data()
@@ -299,11 +326,8 @@ class DfaCoherenceTab(BaseTab):
                 self.log("Нет отфильтрованных данных. Сначала загрузите и отфильтруйте исследования.")
                 return None
             study_ids = filtered_df['study_id'].unique().tolist()
-            if not study_ids:
-                self.log("В отфильтрованных данных нет study_id.")
-                return None
             self.log(f"Используются исследования: {len(study_ids)}")
-
+            
         if self.exclude_central_mixed.get():
             filtered_df = self.main_app.get_filtered_data()
             if filtered_df is not None:
@@ -311,14 +335,14 @@ class DfaCoherenceTab(BaseTab):
                 filtered_df = filtered_df[filtered_df['breathing_impairment_severity'].isin(allowed)]
                 if not filtered_df.empty:
                     study_ids = filtered_df['study_id'].unique().tolist()
-                    self.log(f"После исключения центрального/смешанного апноэ осталось исследований: {len(study_ids)}")
-
+                    self.log(f"После исключения центрального/смешанного апноэ: {len(study_ids)} исследований")
+                    
         def update_progress(page, total, _):
             if total > 0:
                 self.main_app.set_progress(int(page / total * 100))
-
+                
         self.main_app.set_progress(0)
-        self.log("Загрузка эпох из API (может занять несколько минут)...")
+        self.log("Загрузка эпох...")
         epochs = get_epochs(
             api_url, token,
             study_ids=study_ids,
@@ -328,36 +352,37 @@ class DfaCoherenceTab(BaseTab):
             use_cache=self.use_cache.get()
         )
         self.main_app.set_progress(100)
-        if not epochs or self.stop_flag:
+        if not epochs:
             return None
         df = pd.DataFrame(epochs)
-        self.log(f"Загружено {len(df)} эпох.")
-        self.epochs_df = df
+        self.log(f"Загружено {len(df)} эпох")
         return df
-
+        
     # ------------------------------------------------------------
     # Основной анализ (LMM)
     # ------------------------------------------------------------
     def run_analysis(self):
+        mode = self.analysis_mode.get()
+        if mode == 'topo':
+            self._run_topo()
+            return
         if self.epochs_df is None:
             df = self._load_epochs()
             if df is None:
                 return
         else:
             df = self.epochs_df
-
-        # Фильтрация по типу эпох (data_type уже учтён в API)
+            
         df = df[df['data_type'] == self.data_type.get()].copy()
         if df.empty:
             self.log("Нет эпох для выбранного типа данных.")
             return
-
-        # Подготовка данных
+            
+        # Подготовка
         df['has_apnea'] = df['has_apnea'].astype(bool)
         df['patient_id'] = df['patient_id'].astype(int)
         if 'epoch_stage' in df.columns:
             df['epoch_stage'] = df['epoch_stage'].astype('category')
-        # Добавляем ковариаты
         if self.include_covariates.get():
             cov_df = self._get_covariates()
             if cov_df is not None and not cov_df.empty:
@@ -369,10 +394,10 @@ class DfaCoherenceTab(BaseTab):
             else:
                 self.log("Ковариаты не загружены, продолжаем без них.")
                 self.include_covariates.set(False)
-
-        # Формируем список задач в зависимости от режима
+                
+        # Формируем задачи
         tasks = []
-        if self.analysis_mode.get() == 'lmm_dfa':
+        if mode == 'lmm_dfa':
             selected_indices = self.dfa_listbox.curselection()
             if not selected_indices:
                 selected_channels = DFA_CHANNELS
@@ -403,11 +428,11 @@ class DfaCoherenceTab(BaseTab):
                         tasks.append((col, f"Coh {pair_str} {band}", f"{pair_str}_{band}"))
                     else:
                         self.log(f"Столбец {col} не найден, пропускаем.")
-
+                        
         if not tasks:
             self.log("Нет доступных признаков для анализа.")
             return
-
+            
         self.stop_flag = False
         self.run_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
@@ -417,9 +442,9 @@ class DfaCoherenceTab(BaseTab):
         self.diag_btn.config(state=tk.DISABLED)
         self.bootstrap_btn.config(state=tk.DISABLED)
         self.save_diag_btn.config(state=tk.DISABLED)
-
+        
         threading.Thread(target=self._run_lmm_thread, args=(df, tasks), daemon=True).start()
-
+        
     def _run_lmm_thread(self, df, tasks):
         try:
             self.log(f"Всего моделей: {len(tasks)}")
@@ -449,20 +474,22 @@ class DfaCoherenceTab(BaseTab):
             self.report_btn.config(state=tk.NORMAL)
             self.diag_btn.config(state=tk.NORMAL)
             self.bootstrap_btn.config(state=tk.NORMAL)
-            # Заполняем комбобокс для диагностики
             features = sorted(res_df['feature'].unique())
             self.diag_feature_combo['values'] = features
             if features:
                 self.diag_feature_combo.set(features[0])
             n_sign = res_df['significant'].sum()
             self.log(f"LMM завершён. Значимых признаков: {n_sign} (q<{self.fdr_threshold.get()})")
+            # Если есть значимые признаки, строим топографические карты
+            if n_sign > 0:
+                self._plot_topo_from_results(df, res_df)
         except Exception as e:
             self.log(f"Ошибка: {e}")
         finally:
             self.run_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
             self.main_app.set_progress(0)
-
+            
     def _fit_lmm_model(self, df, col, feature_name):
         cols = [col, 'has_apnea', 'patient_id']
         if self.include_stage.get() and 'epoch_stage' in df.columns:
@@ -500,7 +527,7 @@ class DfaCoherenceTab(BaseTab):
         except Exception as e:
             self.log(f"Модель не сошлась для {feature_name}: {e}")
             return None
-
+            
     def _get_covariates(self):
         filtered_df = self.main_app.get_filtered_data()
         if filtered_df is None or filtered_df.empty:
@@ -511,9 +538,9 @@ class DfaCoherenceTab(BaseTab):
         cov = filtered_df[needed].drop_duplicates(subset=['study_id'])
         cov['gender_code'] = (cov['gender'] == 'M').astype(int)
         return cov
-
+        
     # ------------------------------------------------------------
-    # Отображение таблицы и графиков
+    # Отображение таблицы и графиков LMM
     # ------------------------------------------------------------
     def _display_table(self, df):
         for row in self.tree.get_children():
@@ -528,15 +555,14 @@ class DfaCoherenceTab(BaseTab):
             self.tree.column(col, width=100, anchor='center')
         for _, row in df.iterrows():
             self.tree.insert('', 'end', values=[row[c] for c in cols])
-
+            
     def _plot_lmm_results(self, res_df):
         for widget in self.plot_frame.winfo_children():
             widget.destroy()
         if res_df.empty:
             return
-
         fig = Figure(figsize=(12, 8), dpi=100)
-        # Forest plot (топ-20 значимых)
+        # Forest plot
         ax1 = fig.add_subplot(2, 1, 1)
         sign = res_df[res_df['significant']].copy()
         if sign.empty:
@@ -555,7 +581,6 @@ class DfaCoherenceTab(BaseTab):
             ax1.set_xlabel('Beta коэффициент (эффект апноэ)')
             ax1.set_title(f'Топ-20 значимых признаков (FDR < {self.fdr_threshold.get()})')
             ax1.grid(True, alpha=0.3)
-
         # Volcano plot
         ax2 = fig.add_subplot(2, 1, 2)
         colors = np.where(res_df['significant'], 'red', 'gray')
@@ -577,9 +602,130 @@ class DfaCoherenceTab(BaseTab):
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.current_figure = fig
-
+        
     # ------------------------------------------------------------
-    # Диагностика остатков
+    # Топографические карты (DFA и когерентность)
+    # ------------------------------------------------------------
+    def _run_topo(self):
+        if self.epochs_df is None:
+            df = self._load_epochs()
+            if df is None:
+                return
+        else:
+            df = self.epochs_df
+        df = df[df['data_type'] == self.data_type.get()].copy()
+        if df.empty:
+            self.log("Нет данных для топографических карт.")
+            return
+        # Подготовка данных
+        df['has_apnea'] = df['has_apnea'].astype(bool)
+        # Группировка по тяжести (берём из метаданных исследований)
+        filtered_df = self.main_app.get_filtered_data()
+        if filtered_df is not None:
+            severity_map = filtered_df.set_index('study_id')['breathing_impairment_severity'].to_dict()
+            df['severity'] = df['study_id'].map(severity_map)
+            df = df.dropna(subset=['severity'])
+        else:
+            self.log("Нет данных о тяжести ОАС.")
+            return
+            
+        # DFA топо: средний DFA по каналам для каждой группы тяжести
+        fig = Figure(figsize=(12, 10))
+        # Загружаем позиции электродов
+        pos = get_montage()
+        ch_names = DFA_CHANNELS
+        
+        # Для DFA
+        if self.analysis_mode.get() == 'topo':
+            # Показываем DFA по группам
+            groups = sorted(df['severity'].unique())
+            n_groups = len(groups)
+            for idx, sev in enumerate(groups):
+                sub = df[df['severity'] == sev]
+                dfa_vals = []
+                for ch in ch_names:
+                    col = f"{ch}_dfa"
+                    if col in sub.columns:
+                        dfa_vals.append(sub[col].mean())
+                    else:
+                        dfa_vals.append(np.nan)
+                ax = fig.add_subplot(2, (n_groups+1)//2, idx+1)
+                plot_topomap(dfa_vals, pos, axes=ax, show=False)
+                ax.set_title(f"DFA α - {sev}")
+            fig.suptitle("Топография DFA экспонента по группам тяжести ОАС")
+            self._show_topo_figure(fig)
+            return
+            
+    def _plot_topo_from_results(self, df, res_df):
+        """Строит топографические карты для значимых признаков DFA или когерентности"""
+        mode = self.analysis_mode.get()
+        if mode == 'lmm_dfa':
+            # Для DFA: показываем разницу (апноэ - нет апноэ) по каналам
+            sign = res_df[res_df['significant'] & res_df['feature'].str.startswith('DFA')]
+            if sign.empty:
+                return
+            # Вычисляем средний DFA для эпох с апноэ и без
+            df['has_apnea'] = df['has_apnea'].astype(bool)
+            ch_names = DFA_CHANNELS
+            pos = get_montage()
+            diff_vals = []
+            for ch in ch_names:
+                col = f"{ch}_dfa"
+                if col in df.columns:
+                    mean_apnea = df[df['has_apnea']][col].mean()
+                    mean_noapnea = df[~df['has_apnea']][col].mean()
+                    diff_vals.append(mean_apnea - mean_noapnea)
+                else:
+                    diff_vals.append(np.nan)
+            fig = Figure(figsize=(8, 6))
+            ax = fig.add_subplot(111)
+            plot_topomap(diff_vals, pos, axes=ax, show=False)
+            ax.set_title("Разница DFA (апноэ - без апноэ)")
+            self._show_topo_figure(fig)
+        else:  # когерентность
+            # Построим матрицу когерентности для значимых диапазонов
+            sign = res_df[res_df['significant'] & res_df['feature'].str.startswith('Coh')]
+            if sign.empty:
+                return
+            # Выбираем первый значимый диапазон
+            first = sign.iloc[0]['feature']
+            # Извлечём пару и диапазон
+            parts = first.split()
+            pair_str = parts[1]
+            band = parts[2]
+            a, b = pair_str.split('-')
+            col = f"{a}{b}_coh_{band}"
+            # Среднее значение когерентности для эпох с апноэ и без
+            mean_apnea = df[df['has_apnea']][col].mean()
+            mean_noapnea = df[~df['has_apnea']][col].mean()
+            # Построим матрицу связей между всеми парами (только для этого диапазона)
+            # Для простоты покажем только разницу для выбранной пары на схеме электродов
+            fig = Figure(figsize=(8, 6))
+            ax = fig.add_subplot(111)
+            # Рисуем схему электродов
+            pos = get_montage()
+            plot_sensors(pos, axes=ax, show_names=True)
+            # Рисуем линию между a и b с толщиной, пропорциональной разнице
+            if a in pos and b in pos:
+                x1, y1 = pos[a]
+                x2, y2 = pos[b]
+                diff = mean_apnea - mean_noapnea
+                linewidth = 2 + 4 * abs(diff)
+                ax.plot([x1, x2], [y1, y2], 'r-', linewidth=linewidth, alpha=0.7)
+                ax.text((x1+x2)/2, (y1+y2)/2, f"Δ={diff:.2f}", fontsize=8)
+            ax.set_title(f"Когерентность {pair_str} {band}: разница (апноэ - без) = {diff:.3f}")
+            self._show_topo_figure(fig)
+            
+    def _show_topo_figure(self, fig):
+        for widget in self.topo_frame.winfo_children():
+            widget.destroy()
+        canvas = FigureCanvasTkAgg(fig, master=self.topo_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.notebook.select(self.tab_topo)
+        
+    # ------------------------------------------------------------
+    # Диагностика остатков (как в LMM)
     # ------------------------------------------------------------
     def run_diagnostics(self):
         if self.results_df is None:
@@ -589,30 +735,25 @@ class DfaCoherenceTab(BaseTab):
         if not feature:
             messagebox.showwarning("Выбор признака", "Выберите признак для диагностики.")
             return
-        # Находим соответствующую строку в results_df
         row = self.results_df[self.results_df['feature'] == feature]
         if row.empty:
             self.log(f"Признак {feature} не найден в результатах.")
             return
-        # Загружаем эпохи заново или используем сохранённые
         if self.epochs_df is None:
             self.log("Нет загруженных эпох.")
             return
-        # Определяем, какой столбец соответствует этому признаку
-        # Для DFA: признак имеет вид "DFA C3" -> столбец "C3_dfa"
-        # Для когерентности: "Coh F3-C3 delta" -> столбец "F3C3_coh_delta"
-        if self.analysis_mode.get() == 'lmm_dfa':
-            channel = feature.split()[1]
-            col = f"{channel}_dfa"
+        # Определяем столбец
+        if feature.startswith('DFA'):
+            ch = feature.split()[1]
+            col = f"{ch}_dfa"
         else:
-            # feature: "Coh F3-C3 delta"
             parts = feature.split()
-            pair = parts[1]  # "F3-C3"
-            band = parts[2]  # "delta"
-            a, b = pair.split('-')
+            pair_str = parts[1]
+            band = parts[2]
+            a, b = pair_str.split('-')
             col = f"{a}{b}_coh_{band}"
         if col not in self.epochs_df.columns:
-            self.log(f"Столбец {col} не найден в данных.")
+            self.log(f"Столбец {col} не найден.")
             return
         df = self.epochs_df.copy()
         df['has_apnea'] = df['has_apnea'].astype(bool)
@@ -649,7 +790,6 @@ class DfaCoherenceTab(BaseTab):
             bp_model = sm.OLS(resid2, X).fit()
             bp_stat = bp_model.rsquared * len(resid)
             bp_p = 1 - chi2.cdf(bp_stat, df=1)
-            # Сохраняем для CSV
             self.last_diagnostics = {
                 'fitted': fitted,
                 'residuals': resid,
@@ -659,7 +799,6 @@ class DfaCoherenceTab(BaseTab):
                 'feature': feature,
                 'col': col
             }
-            # Графики
             fig = Figure(figsize=(10, 8))
             ax1 = fig.add_subplot(2, 2, 1)
             ax1.scatter(fitted, resid, alpha=0.5)
@@ -694,7 +833,6 @@ class DfaCoherenceTab(BaseTab):
             self.diag_model = result
             self.diag_feature_name = feature
             self.save_diag_btn.config(state=tk.NORMAL)
-            # Запоминаем для отчёта
             self.all_diagnostics.append({
                 'feature': feature,
                 'shapiro_p': shapiro_p,
@@ -705,14 +843,14 @@ class DfaCoherenceTab(BaseTab):
             self.notebook.select(self.tab_diag)
         except Exception as e:
             self.log(f"Ошибка диагностики: {e}")
-
+            
     def _show_diagnostic_plot(self, fig):
         for widget in self.diag_plot_frame.winfo_children():
             widget.destroy()
         canvas = FigureCanvasTkAgg(fig, master=self.diag_plot_frame)
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
+        
     def save_diagnostics_csv(self):
         if not hasattr(self, 'last_diagnostics'):
             messagebox.showwarning("Нет данных", "Сначала выполните диагностику для выбранного признака.")
@@ -724,9 +862,9 @@ class DfaCoherenceTab(BaseTab):
         if path:
             df.to_csv(path, index=False)
             self.log(f"Диагностика сохранена в {path}")
-
+            
     # ------------------------------------------------------------
-    # Блок-бутстрап
+    # Бутстрап
     # ------------------------------------------------------------
     def run_bootstrap(self):
         if self.diag_model is None:
@@ -734,7 +872,7 @@ class DfaCoherenceTab(BaseTab):
             return
         messagebox.showinfo("Бутстрап", "Будет выполнено 1000 итераций (блок-бутстрап по пациентам).\nЭто может занять 1-2 минуты.")
         threading.Thread(target=self._bootstrap_thread, daemon=True).start()
-
+        
     def _bootstrap_thread(self):
         feature = self.diag_feature_name
         col = self.last_diagnostics['col']
@@ -797,7 +935,6 @@ class DfaCoherenceTab(BaseTab):
                 'p_bootstrap': p_bootstrap,
                 'n_iter': len(betas)
             }
-            # Обновляем таблицу
             for row in self.bootstrap_tree.get_children():
                 self.bootstrap_tree.delete(row)
             self.bootstrap_tree.insert('', 'end', values=(
@@ -808,7 +945,6 @@ class DfaCoherenceTab(BaseTab):
                 f"{p_bootstrap:.4f}",
                 "Да" if (ci_low > 0 and ci_high > 0) or (ci_low < 0 and ci_high < 0) else "Нет"
             ))
-            # Гистограмма
             fig = Figure(figsize=(8,5))
             ax = fig.add_subplot(111)
             ax.hist(betas, bins=50, color='skyblue', edgecolor='black', alpha=0.7)
@@ -823,114 +959,16 @@ class DfaCoherenceTab(BaseTab):
             self.log(f"Бутстрап CI для beta: [{ci_low:.4f}, {ci_high:.4f}], p≈{p_bootstrap:.4f}")
         else:
             self.log("Бутстрап не дал результатов.")
-
+            
     def _show_bootstrap_plot(self, fig):
-        # Очищаем область бутстрапа, кроме дерева
         for widget in self.bootstrap_tree_frame.winfo_children():
-            if widget not in (self.bootstrap_tree, self.bootstrap_tree.master.winfo_children()):
+            if widget not in (self.bootstrap_tree, self.bootstrap_tree.master):
                 widget.destroy()
         canvas = FigureCanvasTkAgg(fig, master=self.bootstrap_tree_frame)
         canvas.draw()
         canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self.notebook.select(self.tab_bootstrap)
-
-    # ------------------------------------------------------------
-    # Генерация HTML-отчёта
-    # ------------------------------------------------------------
-    def generate_report(self):
-        if self.results_df is None or self.results_df.empty:
-            messagebox.showwarning("Нет данных", "Сначала выполните LMM анализ.")
-            return
-        # Подготовка данных
-        sign = self.results_df[self.results_df['significant']]
-        n_sign = len(sign)
-        mode = "DFA" if self.analysis_mode.get() == 'lmm_dfa' else "когерентности"
-        # График LMM в base64
-        buf = io.BytesIO()
-        self.current_figure.savefig(buf, format='png', dpi=100, bbox_inches='tight')
-        buf.seek(0)
-        img_base64 = base64.b64encode(buf.read()).decode('utf-8')
-        plot_html = f'<div class="plot"><img src="data:image/png;base64,{img_base64}" style="max-width:100%;"/></div>'
-
-        # Таблица значимых признаков
-        if not sign.empty:
-            table_html = sign[['feature', 'beta', 'p_value', 'q_value', 'ci_low', 'ci_high']].to_html(index=False, float_format="%.4f")
-        else:
-            table_html = "<p>Нет значимых признаков.</p>"
-
-        # Диагностика
-        diag_html = "<h2>Диагностика остатков</h2>"
-        if self.all_diagnostics:
-            diag_html += "<table border='1'><tr><th>Признак</th><th>n</th><th>Shapiro-Wilk p</th><th>Breusch-Pagan p</th><th>Заключение</th></tr>"
-            for d in self.all_diagnostics:
-                shapiro_ok = d['shapiro_p'] > 0.05 if d['shapiro_p'] is not None else "n>5000"
-                bp_ok = d['bp_p'] > 0.05
-                conclusion = []
-                if d['shapiro_p'] is not None and d['shapiro_p'] <= 0.05:
-                    conclusion.append("❗ остатки не нормальны")
-                elif d['shapiro_p'] is None:
-                    conclusion.append("⚠️ выборка >5000")
-                else:
-                    conclusion.append("✅ нормальность")
-                if d['bp_p'] <= 0.05:
-                    conclusion.append("❗ гетероскедастичность")
-                else:
-                    conclusion.append("✅ гомоскедастичность")
-                diag_html += f"<tr><td>{d['feature']}</td><td>{d['n']}</td><td>{d['shapiro_p']:.4f if d['shapiro_p'] else '>5000'}</td><td>{d['bp_p']:.4f}</td><td>{', '.join(conclusion)}</td></tr>"
-            diag_html += "</table>"
-        else:
-            diag_html += "<p>Диагностика не выполнялась.</p>"
-
-        # Бутстрап
-        boot_html = "<h2>Бутстрап-проверка</h2>"
-        if self.bootstrap_results:
-            boot_html += f"""
-            <p><strong>Признак:</strong> {self.bootstrap_results['feature']}</p>
-            <p><strong>95% доверительный интервал для beta:</strong> [{self.bootstrap_results['ci_low']:.4f}, {self.bootstrap_results['ci_high']:.4f}]</p>
-            <p><strong>Бутстрап p-value:</strong> {self.bootstrap_results['p_bootstrap']:.4f}</p>
-            <p><strong>Количество успешных итераций:</strong> {self.bootstrap_results['n_iter']}</p>
-            """
-        else:
-            boot_html += "<p>Бутстрап не выполнялся.</p>"
-
-        params = f"""
-        <p><strong>Тип анализа:</strong> {mode}</p>
-        <p><strong>Тип набора эпох:</strong> {self.data_type.get()} (1=тонический,2=все,3=фильтр по положению)</p>
-        <p><strong>Ковариаты:</strong> {'включены' if self.include_covariates.get() else 'не включены'}</p>
-        <p><strong>Стадия сна:</strong> {'включена' if self.include_stage.get() else 'не включена'}</p>
-        <p><strong>FDR порог:</strong> q = {self.fdr_threshold.get()}</p>
-        """
-
-        html = f"""<!DOCTYPE html>
-        <html>
-        <head><meta charset="utf-8"><title>LMM анализ DFA и когерентности</title>
-        <style>
-            body {{ font-family: Arial; margin:20px; }}
-            table {{ border-collapse: collapse; width:100%; margin-bottom:20px; }}
-            th, td {{ border:1px solid #ddd; padding:8px; text-align:left; }}
-            th {{ background:#f2f2f2; }}
-            .plot {{ margin:20px 0; text-align:center; }}
-        </style>
-        </head>
-        <body>
-        <h1>Отчёт о линейных смешанных моделях (LMM) для {mode}</h1>
-        <p><strong>Дата:</strong> {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-        {params}
-        <h2>Графики LMM</h2>
-        {plot_html}
-        <h2>Значимые признаки (всего {n_sign})</h2>
-        {table_html}
-        {diag_html}
-        {boot_html}
-        <p><em>Примечание:</em> При нарушении нормальности остатков или гетероскедастичности рекомендуется использовать бутстрап-доверительные интервалы.</p>
-        </body></html>
-        """
-        fd, path = tempfile.mkstemp(suffix='.html', prefix='dfa_coh_report_')
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.write(html)
-        webbrowser.open(f'file://{path}')
-        self.log(f"Отчёт открыт в браузере: {path}")
-
+        
     # ------------------------------------------------------------
     # Сохранение результатов
     # ------------------------------------------------------------
@@ -943,7 +981,7 @@ class DfaCoherenceTab(BaseTab):
         if fname:
             self.results_df.to_csv(fname, index=False, encoding='utf-8-sig')
             self.log(f"Сохранено в {fname}")
-
+            
     def save_plot(self):
         if self.current_figure is None:
             messagebox.showwarning("Нет графика", "График не построен.")
@@ -953,3 +991,90 @@ class DfaCoherenceTab(BaseTab):
         if fname:
             self.current_figure.savefig(fname, dpi=150, bbox_inches='tight')
             self.log(f"График сохранён в {fname}")
+            
+    # ------------------------------------------------------------
+    # HTML-отчёт
+    # ------------------------------------------------------------
+    def generate_report(self):
+        if self.results_df is None or self.results_df.empty:
+            messagebox.showwarning("Нет данных", "Сначала выполните LMM анализ.")
+            return
+        sign = self.results_df[self.results_df['significant']]
+        n_sign = len(sign)
+        mode = "DFA" if self.analysis_mode.get() == 'lmm_dfa' else "когерентности"
+        # График LMM
+        buf = io.BytesIO()
+        self.current_figure.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        buf.seek(0)
+        img_base64 = base64.b64encode(buf.read()).decode('utf-8')
+        plot_html = f'<div class="plot"><img src="data:image/png;base64,{img_base64}" style="max-width:100%;"/></div>'
+        # Таблица значимых признаков
+        if not sign.empty:
+            table_html = sign[['feature', 'beta', 'p_value', 'q_value', 'ci_low', 'ci_high']].to_html(index=False, float_format="%.4f")
+        else:
+            table_html = "<p>Нет значимых признаков.</p>"
+        # Диагностика
+        diag_html = "<h2>Диагностика остатков</h2>"
+        if self.all_diagnostics:
+            diag_html += "<table border='1'><tr><th>Признак</th><th>n</th><th>Shapiro-Wilk p</th><th>Breusch-Pagan p</th><th>Заключение</th></tr>"
+            for d in self.all_diagnostics:
+                shapiro_str = f"{d['shapiro_p']:.4f}" if d['shapiro_p'] is not None else ">5000"
+                bp_ok = d['bp_p'] > 0.05
+                conclusion = []
+                if d['shapiro_p'] is not None and d['shapiro_p'] <= 0.05:
+                    conclusion.append("❗ не нормальны")
+                elif d['shapiro_p'] is None:
+                    conclusion.append("⚠️ n>5000")
+                else:
+                    conclusion.append("✅ нормальность")
+                conclusion.append("✅ гомоскедастичность" if bp_ok else "❗ гетероскедастичность")
+                diag_html += f"<tr><td>{d['feature']}</td><td>{d['n']}</td><td>{shapiro_str}</td><td>{d['bp_p']:.4f}</td><td>{', '.join(conclusion)}</td></tr>"
+            diag_html += "</table>"
+        else:
+            diag_html += "<p>Диагностика не выполнялась.</p>"
+        # Бутстрап
+        boot_html = "<h2>Бутстрап-проверка</h2>"
+        if self.bootstrap_results:
+            boot_html += f"""
+            <p><strong>Признак:</strong> {self.bootstrap_results['feature']}</p>
+            <p><strong>95% CI:</strong> [{self.bootstrap_results['ci_low']:.4f}, {self.bootstrap_results['ci_high']:.4f}]</p>
+            <p><strong>p-value (бутстрап):</strong> {self.bootstrap_results['p_bootstrap']:.4f}</p>
+            """
+        else:
+            boot_html += "<p>Бутстрап не выполнялся.</p>"
+        params = f"""
+        <p><strong>Тип анализа:</strong> {mode}</p>
+        <p><strong>Тип набора эпох:</strong> {self.data_type.get()} (1=тонический,2=все,3=фильтр по положению)</p>
+        <p><strong>Ковариаты:</strong> {'включены' if self.include_covariates.get() else 'не включены'}</p>
+        <p><strong>Стадия сна:</strong> {'включена' if self.include_stage.get() else 'не включена'}</p>
+        <p><strong>FDR порог:</strong> q = {self.fdr_threshold.get()}</p>
+        """
+        html = f"""<!DOCTYPE html>
+        <html>
+        <head><meta charset="utf-8"><title>LMM для DFA и когерентности (Глава 2)</title>
+        <style>
+            body {{ font-family: Arial; margin:20px; }}
+            table {{ border-collapse: collapse; width:100%; margin-bottom:20px; }}
+            th, td {{ border:1px solid #ddd; padding:8px; text-align:left; }}
+            th {{ background:#f2f2f2; }}
+            .plot {{ margin:20px 0; text-align:center; }}
+        </style>
+        </head>
+        <body>
+        <h1>Отчёт о линейных смешанных моделях для {mode}</h1>
+        <p><strong>Дата:</strong> {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        {params}
+        <h2>Графики LMM</h2>
+        {plot_html}
+        <h2>Значимые признаки (всего {n_sign})</h2>
+        {table_html}
+        {diag_html}
+        {boot_html}
+        <p><em>Примечание:</em> Для DFA положительный beta означает повышение экспонента α при апноэ (увеличение персистентности). Для когерентности – усиление связи. Топографические карты доступны во вкладке "Топографические карты".</p>
+        </body></html>
+        """
+        fd, path = tempfile.mkstemp(suffix='.html', prefix='dfa_coh_report_')
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(html)
+        webbrowser.open(f'file://{path}')
+        self.log(f"Отчёт открыт в браузере: {path}")
