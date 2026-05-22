@@ -642,7 +642,8 @@ class GAMTab(BaseTab):
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(html)
         webbrowser.open(f'file://{path}')
-        self.log(f"Отчёт открыт в браузере: {path}")        self.use_cache = tk.BooleanVar(value=True)   # ДОБАВЛЕНО
+        self.log(f"Отчёт открыт в браузере: {path}")        
+        self.use_cache = tk.BooleanVar(value=True)
         self.stop_flag = False
         self.model = None
         self.gam_summary = None
