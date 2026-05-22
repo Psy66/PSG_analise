@@ -76,6 +76,7 @@ class MainWindow:
         from ui.tab_event_locked import EventLockedTab
         from ui.tab_gam import GAMTab
         from ui.tab_dfa_coherence import DfaCoherenceTab
+        from ui.tab_clustering import ClusteringTab
 
         self.tabs['load'] = LoadDataTab(self.notebook, self)
         self.notebook.add(self.tabs['load'], text="Загрузка и фильтры")
@@ -98,6 +99,9 @@ class MainWindow:
         
         self.tabs['gam'] = GAMTab(self.notebook, self)
         self.notebook.add(self.tabs['gam'], text="GAM анализ")
+
+        self.tabs['clustering'] = ClusteringTab(self.notebook, self)
+        self.notebook.add(self.tabs['clustering'], text="Кластеризация (2.5.5)")
         
     def on_tab_changed(self, event):
         current = self.notebook.select()
