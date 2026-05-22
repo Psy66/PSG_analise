@@ -69,8 +69,8 @@ class MainWindow:
         # self.tabs['pca'] = PCAAnalysisTab(self.notebook, self)
         # self.notebook.add(self.tabs['pca'], text="PCA анализ")
 
-        # self.tabs['event_locked'] = EventLockedTab(self.notebook, self)
-        # self.notebook.add(self.tabs['event_locked'], text="Event‑locked анализ")
+        self.tabs['event_locked'] = EventLockedTab(self.notebook, self)
+        self.notebook.add(self.tabs['event_locked'], text="Event‑locked анализ")
 
         # self.tabs['gam'] = GAMTab(self.notebook, self)
         # self.notebook.add(self.tabs['gam'], text="GAM анализ")
