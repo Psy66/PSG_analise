@@ -8,54 +8,31 @@ class MainWindow:
     def __init__(self, root):
         self.root = root
         root.title("PSG Analysis Tool")
-        # Устанавливаем начальный размер, но окно можно развернуть на весь экран
-        root.geometry("1200x800")
+        root.geometry("1600x1200")
         root.configure(bg='#f0f0f0')
 
-        # Создаём контейнер с прокруткой
-        main_canvas = tk.Canvas(root, borderwidth=0, highlightthickness=0, bg='#f0f0f0')
-        scrollbar = ttk.Scrollbar(root, orient=tk.VERTICAL, command=main_canvas.yview)
-        main_canvas.configure(yscrollcommand=scrollbar.set)
+        self.status_var = tk.StringVar(value="Готов")
+        self.progress_var = tk.IntVar(value=0)
 
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        main_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        # Внутренний фрейм, в который будем помещать всё содержимое
-        self.inner_frame = ttk.Frame(main_canvas)
-        self.canvas_window = main_canvas.create_window((0, 0), window=self.inner_frame, anchor="nw")
-
-        # Обновляем прокрутку при изменении размеров внутреннего фрейма
-        self.inner_frame.bind("<Configure>", lambda e: main_canvas.configure(scrollregion=main_canvas.bbox("all")))
-        # Также при изменении размера canvas подстраиваем ширину внутреннего фрейма
-        main_canvas.bind("<Configure>", lambda e: main_canvas.itemconfig(self.canvas_window, width=e.width))
-
-        # ========== ВСЁ ОСТАЛЬНОЕ РАЗМЕЩАЕМ ВНУТРИ inner_frame ==========
-        # Notebook с вкладками
-        self.notebook = ttk.Notebook(self.inner_frame)
+        self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # Прогресс и статус (помещаем в отдельный фрейм, который не будет прокручиваться вместе со всем?)
-        # На самом деле оставим всё внутри прокручиваемой области — пользователь при необходимости прокрутит.
-        progress_frame = ttk.Frame(self.inner_frame)
-        progress_frame.pack(fill=tk.X, padx=10, pady=5)
-
-        self.progress_var = tk.IntVar(value=0)
+        # Прогресс и статус
+        progress_frame = ttk.Frame(root)
+        progress_frame.pack(fill=tk.X, padx=10, pady=2)
         self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100)
         self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        self.status_var = tk.StringVar(value="Готов")
         self.status_bar = ttk.Label(progress_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         self.status_bar.pack(side=tk.RIGHT, padx=5)
 
-        # Лог (используем scrolledtext, который сам умеет прокручиваться, но он внутри внешней прокрутки)
-        log_frame = ttk.LabelFrame(self.inner_frame, text="Лог", padding=5)
+        # Лог
+        log_frame = ttk.LabelFrame(root, text="Лог", padding=5)
         log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        self.log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, height=8, font=("Courier New", 9))
+        self.log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, height=12, font=("Courier New", 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
         # Кнопка выхода внизу справа
-        button_frame = ttk.Frame(self.inner_frame)
+        button_frame = ttk.Frame(root)
         button_frame.pack(fill=tk.X, padx=10, pady=5)
         exit_btn = ttk.Button(button_frame, text="Выход", command=self.quit_app)
         exit_btn.pack(side=tk.RIGHT)
@@ -65,6 +42,7 @@ class MainWindow:
         self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
 
     def quit_app(self):
+        """Завершает приложение."""
         if messagebox.askyesno("Подтверждение", "Выйти из программы?"):
             self.root.quit()
 
@@ -76,7 +54,7 @@ class MainWindow:
         from ui.tab_event_locked import EventLockedTab
         from ui.tab_gam import GAMTab
         from ui.tab_dfa_coherence import DfaCoherenceTab
-        from ui.tab_clustering import ClusteringTab
+
 
         self.tabs['load'] = LoadDataTab(self.notebook, self)
         self.notebook.add(self.tabs['load'], text="Загрузка и фильтры")
@@ -88,21 +66,18 @@ class MainWindow:
         self.tabs['lmm'] = LMMAnalysisTab(self.notebook, self)
         self.notebook.add(self.tabs['lmm'], text="LMM анализ")
 
-        self.tabs['event_locked'] = EventLockedTab(self.notebook, self)
-        self.notebook.add(self.tabs['event_locked'], text="Event‑locked анализ")
+        # self.tabs['pca'] = PCAAnalysisTab(self.notebook, self)
+        # self.notebook.add(self.tabs['pca'], text="PCA анализ")
 
-        self.tabs['pca'] = PCAAnalysisTab(self.notebook, self)
-        self.notebook.add(self.tabs['pca'], text="PCA анализ")
+        # self.tabs['event_locked'] = EventLockedTab(self.notebook, self)
+        # self.notebook.add(self.tabs['event_locked'], text="Event‑locked анализ")
 
-        self.tabs['dfa_coherence'] = DfaCoherenceTab(self.notebook, self)
-        self.notebook.add(self.tabs['dfa_coherence'], text="DFA и когерентность")
-        
-        self.tabs['gam'] = GAMTab(self.notebook, self)
-        self.notebook.add(self.tabs['gam'], text="GAM анализ")
+        # self.tabs['gam'] = GAMTab(self.notebook, self)
+        # self.notebook.add(self.tabs['gam'], text="GAM анализ")
 
-        self.tabs['clustering'] = ClusteringTab(self.notebook, self)
-        self.notebook.add(self.tabs['clustering'], text="Кластеризация (2.5.5)")
-        
+        # self.tabs['dfa_coherence'] = DfaCoherenceTab(self.notebook, self)
+        # self.notebook.add(self.tabs['dfa_coherence'], text="DFA и когерентность")
+
     def on_tab_changed(self, event):
         current = self.notebook.select()
         tab = self.notebook.nametowidget(current)
@@ -138,9 +113,11 @@ class MainWindow:
                 getattr(self, 'include_central_mixed', False))
 
     def get_covariates_for_studies(self):
+        """Возвращает DataFrame с ковариатами (study_id, age_at_study, gender_code, bmi)"""
         df = self.get_filtered_data()
         if df is None or df.empty:
             return pd.DataFrame()
+        # Убеждаемся, что колонки есть
         needed = ['study_id', 'age_at_study', 'gender', 'bmi']
         for col in needed:
             if col not in df.columns:
