@@ -19,6 +19,10 @@ from scipy.interpolate import interp1d
 from scipy.stats import shapiro
 from ui.base_tab import BaseTab
 from core.api_client import get_event_time_series, get_studies
+from core.config import PAGE_SIZE  # стандартный размер страницы, можно увеличить
+
+# Для ускорения загрузки временно увеличим page_size для этого запроса
+EVENT_PAGE_SIZE = 5000  # больше страниц – меньше запросов
 
 class EventLockedTab(BaseTab):
     def __init__(self, parent, main_app):
@@ -49,6 +53,7 @@ class EventLockedTab(BaseTab):
         main_container = ttk.Frame(self)
         main_container.pack(fill=tk.BOTH, expand=True)
         
+        # Панель с прокруткой для левой области (чтобы всё помещалось)
         canvas = tk.Canvas(main_container, borderwidth=0, highlightthickness=0)
         scrollbar = ttk.Scrollbar(main_container, orient=tk.VERTICAL, command=canvas.yview)
         canvas.configure(yscrollcommand=scrollbar.set)
@@ -58,22 +63,26 @@ class EventLockedTab(BaseTab):
         canvas.create_window((0, 0), window=inner, anchor="nw")
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         
+        # Горизонтальное разделение
         paned = ttk.PanedWindow(inner, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
+        
         left_frame = ttk.Frame(paned)
         paned.add(left_frame, weight=1)
         right_frame = ttk.Frame(paned)
         paned.add(right_frame, weight=2)
         
+        # Устанавливаем минимальную ширину правой панели, чтобы вкладки не сжимались
+        right_frame.config(width=600)
+        
         # ========== ЛЕВАЯ ПАНЕЛЬ ==========
-        # --- Описание метода (как в LMM) ---
         info_frame = ttk.LabelFrame(left_frame, text="Источник данных", padding=5)
         info_frame.pack(fill=tk.X, padx=5, pady=5)
         ttk.Label(info_frame, text="Используются отфильтрованные данные из вкладки 'Загрузка'",
                   foreground="blue").pack(anchor=tk.W)
         ttk.Label(info_frame, text="(токен и URL не требуются)").pack(anchor=tk.W)
         
-        desc_frame = ttk.LabelFrame(left_frame, text="Что такое event‑locked анализ?", padding=5)
+        desc_frame = ttk.LabelFrame(left_frame, text="Что такое event‑locked анализ (Глава 2, п. 2.4.3)?", padding=5)
         desc_frame.pack(fill=tk.X, padx=5, pady=5)
         desc_text = ("Event‑locked анализ позволяет оценить динамику гамма‑активности (30–45 Гц) "
                      "относительно окончания респираторного события (offset). Строятся средние кривые "
@@ -82,8 +91,8 @@ class EventLockedTab(BaseTab):
         ttk.Label(desc_frame, text=desc_text, justify=tk.LEFT, wraplength=600).pack(anchor=tk.W, fill=tk.X, padx=5, pady=2)
         ttk.Button(desc_frame, text="Показать инструкцию", command=self.show_instructions).pack(anchor=tk.W, padx=5, pady=2)
         
-        # --- Параметры анализа ---
-        param_frame = ttk.LabelFrame(left_frame, text="Параметры", padding=5)
+        # Параметры
+        param_frame = ttk.LabelFrame(left_frame, text="Параметры анализа", padding=5)
         param_frame.pack(fill=tk.X, padx=5, pady=5)
         ttk.Label(param_frame, text="Канал:").grid(row=0, column=0, sticky=tk.W)
         ttk.Combobox(param_frame, textvariable=self.channel, values=['C3','C4'], state='readonly').grid(row=0, column=1, padx=5)
@@ -94,7 +103,7 @@ class EventLockedTab(BaseTab):
         ttk.Entry(param_frame, textvariable=self.time_max, width=8).grid(row=1, column=4, padx=2)
         ttk.Label(param_frame, text="Доверительный интервал:").grid(row=2, column=0, sticky=tk.W)
         ttk.Entry(param_frame, textvariable=self.confidence_level, width=6).grid(row=2, column=1, padx=5, sticky=tk.W)
-        ttk.Checkbutton(param_frame, text="Использовать отфильтрованные исследования (из вкладки 'Загрузка')",
+        ttk.Checkbutton(param_frame, text="Использовать отфильтрованные исследования",
                         variable=self.use_filtered).grid(row=3, column=0, columnspan=5, sticky=tk.W, pady=5)
         
         # Кэширование
@@ -102,8 +111,9 @@ class EventLockedTab(BaseTab):
         cache_frame.pack(fill=tk.X, padx=5, pady=5)
         ttk.Checkbutton(cache_frame, text="Использовать кэш (ускоряет повторные запуски)",
                         variable=self.use_cache).pack(anchor=tk.W)
+        ttk.Label(cache_frame, text="Страница загрузки: 5000 записей (ускорение)", foreground="gray").pack(anchor=tk.W)
         
-        # ---- Проверка нормальности метрик ----
+        # Проверка нормальности метрик
         norm_frame = ttk.LabelFrame(left_frame, text="Проверка нормальности метрик", padding=5)
         norm_frame.pack(fill=tk.X, padx=5, pady=5)
         ttk.Label(norm_frame, text="Группа:").grid(row=0, column=0, sticky=tk.W)
@@ -118,7 +128,7 @@ class EventLockedTab(BaseTab):
         self.norm_btn = ttk.Button(norm_frame, text="Проверить нормальность", command=self.check_normality_metrics, state=tk.DISABLED)
         self.norm_btn.grid(row=2, column=0, columnspan=2, pady=2)
         
-        # ---- Бутстрап сравнения групп ----
+        # Бутстрап сравнения групп
         bootstrap_frame = ttk.LabelFrame(left_frame, text="Бутстрап сравнения групп", padding=5)
         bootstrap_frame.pack(fill=tk.X, padx=5, pady=5)
         ttk.Label(bootstrap_frame, text="Группа 1:").grid(row=0, column=0, sticky=tk.W)
@@ -151,7 +161,7 @@ class EventLockedTab(BaseTab):
         self.report_btn = ttk.Button(btn_frame, text="Сформировать отчёт", command=self.generate_report, state=tk.DISABLED)
         self.report_btn.pack(side=tk.LEFT, padx=5)
         
-        # ========== ПРАВАЯ ПАНЕЛЬ ==========
+        # ========== ПРАВАЯ ПАНЕЛЬ: Notebook с вкладками ==========
         self.notebook = ttk.Notebook(right_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
@@ -202,9 +212,6 @@ class EventLockedTab(BaseTab):
         self.log_text = tk.Text(self.tab_log, wrap=tk.WORD, font=("Courier New", 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
         
-    # ------------------------------------------------------------
-    # Вспомогательные методы
-    # ------------------------------------------------------------
     def log(self, msg):
         self.log_text.insert(tk.END, msg + "\n")
         self.log_text.see(tk.END)
@@ -216,8 +223,8 @@ class EventLockedTab(BaseTab):
         
     def show_instructions(self):
         msg = (
-            "ИНСТРУКЦИЯ ПО EVENT‑LOCKED АНАЛИЗУ\n"
-            "===================================\n"
+            "ИНСТРУКЦИЯ ПО EVENT‑LOCKED АНАЛИЗУ (Глава 2, п. 2.4.3)\n"
+            "===================================================\n"
             "1. Загрузите и отфильтруйте данные на вкладке 'Загрузка и фильтры'.\n"
             "2. Выберите канал (C3 или C4) и временной интервал (по умолчанию -60…+30 с).\n"
             "3. Нажмите 'Запустить анализ'. Будут построены средние кривые γ‑мощности для групп тяжести ОАС.\n"
@@ -226,6 +233,7 @@ class EventLockedTab(BaseTab):
             "6. Для сравнения групп выберите две группы, метрику и нажмите 'Бутстрап' (1000 итераций).\n"
             "7. Кнопка 'Сформировать отчёт' создаст HTML-отчёт со всеми графиками и таблицами.\n"
             "8. Результаты можно сохранить в CSV (метрики) и PNG (график).\n"
+            "9. При медленной загрузке увеличьте page_size в конфиге или используйте кэш."
         )
         messagebox.showinfo("Инструкция", msg)
         
@@ -245,12 +253,11 @@ class EventLockedTab(BaseTab):
         
     def _run_analysis_thread(self):
         try:
-            # Берём настройки API из вкладки загрузки
             load_tab = self.main_app.tabs['load']
             api_url = load_tab.api_url.get().rstrip('/')
             token = load_tab.token.get().strip()
             if not api_url or not token:
-                self.log("Ошибка: не указаны URL или токен API. Перейдите на вкладку 'Загрузка и фильтры' и введите данные.")
+                self.log("Ошибка: не указаны URL или токен API. Перейдите на вкладку 'Загрузка и фильтры'.")
                 return
                 
             study_ids = None
@@ -270,6 +277,7 @@ class EventLockedTab(BaseTab):
                     self.main_app.set_progress(int(page / total * 100))
                     
             self.main_app.set_progress(0)
+            # Используем увеличенный page_size для ускорения
             ts_data = get_event_time_series(
                 api_url, token,
                 study_ids=study_ids,
@@ -278,7 +286,8 @@ class EventLockedTab(BaseTab):
                 time_from_offset_max=self.time_max.get(),
                 stop_check=lambda: self.stop_flag,
                 progress_callback=update_progress,
-                use_cache=self.use_cache.get()
+                use_cache=self.use_cache.get(),
+                page_size=EVENT_PAGE_SIZE  # передаём увеличенный размер
             )
             self.main_app.set_progress(100)
             if not ts_data:
@@ -415,7 +424,7 @@ class EventLockedTab(BaseTab):
         ax.set_xlabel('Время относительно окончания события (сек)')
         ax.set_ylabel('Гамма-мощность, % от фона')
         ax.set_title('Динамика гамма-активности вокруг респираторных событий')
-        ax.legend()
+        ax.legend(loc='best')
         ax.grid(True, alpha=0.3)
         canvas = FigureCanvasTkAgg(fig, master=self.plot_frame)
         canvas.draw()
@@ -435,11 +444,7 @@ class EventLockedTab(BaseTab):
                 row['n_patients']
             ))
             
-    # ------------------------------------------------------------
-    # Проверка нормальности метрик
-    # ------------------------------------------------------------
     def _compute_patient_metrics(self):
-        """Возвращает dict: severity -> DataFrame с per-patient метриками"""
         if self.patient_curves is None or self.common_time is None:
             return None
         records = []
@@ -518,9 +523,6 @@ class EventLockedTab(BaseTab):
         self.notebook.select(self.tab_diag)
         self.log(f"Проверка нормальности для {group} {metric} завершена.")
         
-    # ------------------------------------------------------------
-    # Блок-бутстрап для сравнения групп
-    # ------------------------------------------------------------
     def run_bootstrap(self):
         if self.patient_curves is None:
             messagebox.showwarning("Нет данных", "Сначала выполните анализ.")
@@ -585,6 +587,7 @@ class EventLockedTab(BaseTab):
         ax.set_title(f'Бутстрап распределение разницы: {group1} - {group2}')
         ax.legend()
         # Очищаем предыдущие виджеты в bootstrap_tree_frame, кроме дерева и скролла
+        sb = self.bootstrap_tree_frame.children.get('!scrollbar2')  # костыль, но лучше сохранить ссылку
         for widget in self.bootstrap_tree_frame.winfo_children():
             if widget not in (self.bootstrap_tree, sb):
                 widget.destroy()
@@ -609,9 +612,6 @@ class EventLockedTab(BaseTab):
                     "Да" if res['significant'] else "Нет"
                 ))
                 
-    # ------------------------------------------------------------
-    # Генерация HTML-отчёта
-    # ------------------------------------------------------------
     def generate_report(self):
         if self.results_df is None or self.summary is None:
             messagebox.showwarning("Нет данных", "Сначала выполните анализ.")
@@ -654,7 +654,7 @@ class EventLockedTab(BaseTab):
         """
         html = f"""<!DOCTYPE html>
         <html>
-        <head><meta charset="utf-8"><title>Event‑locked анализ</title>
+        <head><meta charset="utf-8"><title>Event‑locked анализ γ-активности</title>
         <style>
             body {{ font-family: Arial; margin:20px; }}
             table {{ border-collapse: collapse; width:100%; margin-bottom:20px; }}
@@ -664,7 +664,7 @@ class EventLockedTab(BaseTab):
         </style>
         </head>
         <body>
-        <h1>Отчёт event‑locked анализа гамма‑активности</h1>
+        <h1>Отчёт event‑locked анализа гамма‑активности (Глава 2, п. 2.4.3)</h1>
         <p><strong>Дата:</strong> {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
         {params}
         <h2>График динамики γ‑мощности</h2>
@@ -682,9 +682,6 @@ class EventLockedTab(BaseTab):
         webbrowser.open(f'file://{path}')
         self.log(f"Отчёт открыт в браузере: {path}")
         
-    # ------------------------------------------------------------
-    # Сохранение
-    # ------------------------------------------------------------
     def save_results_csv(self):
         if self.results_df is None or self.results_df.empty:
             messagebox.showwarning("Нет данных", "Нет результатов для сохранения.")
