@@ -66,17 +66,17 @@ class MainWindow:
         self.tabs['lmm'] = LMMAnalysisTab(self.notebook, self)
         self.notebook.add(self.tabs['lmm'], text="LMM анализ")
 
-        # self.tabs['pca'] = PCAAnalysisTab(self.notebook, self)
-        # self.notebook.add(self.tabs['pca'], text="PCA анализ")
-
         self.tabs['event_locked'] = EventLockedTab(self.notebook, self)
         self.notebook.add(self.tabs['event_locked'], text="Event‑locked анализ")
 
+        self.tabs['dfa_coherence'] = DfaCoherenceTab(self.notebook, self)
+        self.notebook.add(self.tabs['dfa_coherence'], text="DFA и когерентность")
+        
+        # self.tabs['pca'] = PCAAnalysisTab(self.notebook, self)
+        # self.notebook.add(self.tabs['pca'], text="PCA анализ")
+        
         # self.tabs['gam'] = GAMTab(self.notebook, self)
         # self.notebook.add(self.tabs['gam'], text="GAM анализ")
-
-        # self.tabs['dfa_coherence'] = DfaCoherenceTab(self.notebook, self)
-        # self.notebook.add(self.tabs['dfa_coherence'], text="DFA и когерентность")
 
     def on_tab_changed(self, event):
         current = self.notebook.select()
