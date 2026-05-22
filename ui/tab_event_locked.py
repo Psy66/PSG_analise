@@ -16,17 +16,13 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from scipy import stats
 from scipy.integrate import trapezoid
 from scipy.interpolate import interp1d
-from scipy.stats import false_discovery_control, shapiro, chi2
-import statsmodels.formula.api as smf
+from scipy.stats import shapiro
 from ui.base_tab import BaseTab
 from core.api_client import get_event_time_series, get_studies
-from core.config import DEFAULT_API_URL, DEFAULT_TOKEN
 
 class EventLockedTab(BaseTab):
     def __init__(self, parent, main_app):
         super().__init__(parent, main_app)
-        self.api_url = tk.StringVar(value=DEFAULT_API_URL)
-        self.token = tk.StringVar(value=DEFAULT_TOKEN)
         self.channel = tk.StringVar(value='C3')
         self.time_min = tk.DoubleVar(value=-60.0)
         self.time_max = tk.DoubleVar(value=30.0)
@@ -34,17 +30,16 @@ class EventLockedTab(BaseTab):
         self.confidence_level = tk.DoubleVar(value=0.95)
         self.use_cache = tk.BooleanVar(value=True)
         self.stop_flag = False
-        self.results_df = None          # метрики по группам
-        self.summary = None             # список dict для кривых (mean, ci, time)
+        self.results_df = None
+        self.summary = None
         self.common_time = None
         self.current_figure = None
-        self.patient_curves = None      # сырые кривые для бутстрапа
-        self.grouped_by_sev = None      # dict {severity: list of arrays}
+        self.patient_curves = None
+        self.grouped_by_sev = None
         
         # Для диагностики и бутстрапа
-        self.normality_results = {}     # {metric_group: shapiro p}
-        self.bootstrap_results = {}     # {comparison: {metric: [ci_low, ci_high, p]}}
-        self.diag_model = None
+        self.normality_results = {}
+        self.bootstrap_results = {}
         self.diag_figure = None
         self.bootstrap_figure = None
         
@@ -53,6 +48,7 @@ class EventLockedTab(BaseTab):
     def _create_widgets(self):
         main_container = ttk.Frame(self)
         main_container.pack(fill=tk.BOTH, expand=True)
+        
         canvas = tk.Canvas(main_container, borderwidth=0, highlightthickness=0)
         scrollbar = ttk.Scrollbar(main_container, orient=tk.VERTICAL, command=canvas.yview)
         canvas.configure(yscrollcommand=scrollbar.set)
@@ -70,13 +66,23 @@ class EventLockedTab(BaseTab):
         paned.add(right_frame, weight=2)
         
         # ========== ЛЕВАЯ ПАНЕЛЬ ==========
-        api_frame = ttk.LabelFrame(left_frame, text="Подключение к API", padding=5)
-        api_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(api_frame, text="URL:").grid(row=0, column=0, sticky=tk.W)
-        ttk.Entry(api_frame, textvariable=self.api_url, width=40).grid(row=0, column=1, padx=5)
-        ttk.Label(api_frame, text="Токен:").grid(row=1, column=0, sticky=tk.W)
-        ttk.Entry(api_frame, textvariable=self.token, width=40, show="*").grid(row=1, column=1, padx=5)
+        # --- Описание метода (как в LMM) ---
+        info_frame = ttk.LabelFrame(left_frame, text="Источник данных", padding=5)
+        info_frame.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Label(info_frame, text="Используются отфильтрованные данные из вкладки 'Загрузка'",
+                  foreground="blue").pack(anchor=tk.W)
+        ttk.Label(info_frame, text="(токен и URL не требуются)").pack(anchor=tk.W)
         
+        desc_frame = ttk.LabelFrame(left_frame, text="Что такое event‑locked анализ?", padding=5)
+        desc_frame.pack(fill=tk.X, padx=5, pady=5)
+        desc_text = ("Event‑locked анализ позволяет оценить динамику гамма‑активности (30–45 Гц) "
+                     "относительно окончания респираторного события (offset). Строятся средние кривые "
+                     "для групп тяжести ОАС с 95% доверительными интервалами, вычисляются пик, латентность "
+                     "и площадь под кривой (AUC). Метод выявляет различия в корковом возбуждении после апноэ.")
+        ttk.Label(desc_frame, text=desc_text, justify=tk.LEFT, wraplength=600).pack(anchor=tk.W, fill=tk.X, padx=5, pady=2)
+        ttk.Button(desc_frame, text="Показать инструкцию", command=self.show_instructions).pack(anchor=tk.W, padx=5, pady=2)
+        
+        # --- Параметры анализа ---
         param_frame = ttk.LabelFrame(left_frame, text="Параметры", padding=5)
         param_frame.pack(fill=tk.X, padx=5, pady=5)
         ttk.Label(param_frame, text="Канал:").grid(row=0, column=0, sticky=tk.W)
@@ -91,12 +97,13 @@ class EventLockedTab(BaseTab):
         ttk.Checkbutton(param_frame, text="Использовать отфильтрованные исследования (из вкладки 'Загрузка')",
                         variable=self.use_filtered).grid(row=3, column=0, columnspan=5, sticky=tk.W, pady=5)
         
+        # Кэширование
         cache_frame = ttk.LabelFrame(left_frame, text="Кэширование", padding=5)
         cache_frame.pack(fill=tk.X, padx=5, pady=5)
         ttk.Checkbutton(cache_frame, text="Использовать кэш (ускоряет повторные запуски)",
                         variable=self.use_cache).pack(anchor=tk.W)
         
-        # ---- Новые разделы: диагностика и бутстрап ----
+        # ---- Проверка нормальности метрик ----
         norm_frame = ttk.LabelFrame(left_frame, text="Проверка нормальности метрик", padding=5)
         norm_frame.pack(fill=tk.X, padx=5, pady=5)
         ttk.Label(norm_frame, text="Группа:").grid(row=0, column=0, sticky=tk.W)
@@ -111,6 +118,7 @@ class EventLockedTab(BaseTab):
         self.norm_btn = ttk.Button(norm_frame, text="Проверить нормальность", command=self.check_normality_metrics, state=tk.DISABLED)
         self.norm_btn.grid(row=2, column=0, columnspan=2, pady=2)
         
+        # ---- Бутстрап сравнения групп ----
         bootstrap_frame = ttk.LabelFrame(left_frame, text="Бутстрап сравнения групп", padding=5)
         bootstrap_frame.pack(fill=tk.X, padx=5, pady=5)
         ttk.Label(bootstrap_frame, text="Группа 1:").grid(row=0, column=0, sticky=tk.W)
@@ -143,7 +151,7 @@ class EventLockedTab(BaseTab):
         self.report_btn = ttk.Button(btn_frame, text="Сформировать отчёт", command=self.generate_report, state=tk.DISABLED)
         self.report_btn.pack(side=tk.LEFT, padx=5)
         
-        # ========== ПРАВАЯ ПАНЕЛЬ: ноутбук с вкладками ==========
+        # ========== ПРАВАЯ ПАНЕЛЬ ==========
         self.notebook = ttk.Notebook(right_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
@@ -194,6 +202,9 @@ class EventLockedTab(BaseTab):
         self.log_text = tk.Text(self.tab_log, wrap=tk.WORD, font=("Courier New", 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
         
+    # ------------------------------------------------------------
+    # Вспомогательные методы
+    # ------------------------------------------------------------
     def log(self, msg):
         self.log_text.insert(tk.END, msg + "\n")
         self.log_text.see(tk.END)
@@ -202,6 +213,21 @@ class EventLockedTab(BaseTab):
     def stop_analysis(self):
         self.stop_flag = True
         self.log("Остановка запрошена...")
+        
+    def show_instructions(self):
+        msg = (
+            "ИНСТРУКЦИЯ ПО EVENT‑LOCKED АНАЛИЗУ\n"
+            "===================================\n"
+            "1. Загрузите и отфильтруйте данные на вкладке 'Загрузка и фильтры'.\n"
+            "2. Выберите канал (C3 или C4) и временной интервал (по умолчанию -60…+30 с).\n"
+            "3. Нажмите 'Запустить анализ'. Будут построены средние кривые γ‑мощности для групп тяжести ОАС.\n"
+            "4. После завершения откроется вкладка 'График' и таблица метрик.\n"
+            "5. Для проверки нормальности метрик выберите группу и метрику → 'Проверить нормальность'.\n"
+            "6. Для сравнения групп выберите две группы, метрику и нажмите 'Бутстрап' (1000 итераций).\n"
+            "7. Кнопка 'Сформировать отчёт' создаст HTML-отчёт со всеми графиками и таблицами.\n"
+            "8. Результаты можно сохранить в CSV (метрики) и PNG (график).\n"
+        )
+        messagebox.showinfo("Инструкция", msg)
         
     def run_analysis(self):
         self.stop_flag = False
@@ -219,11 +245,19 @@ class EventLockedTab(BaseTab):
         
     def _run_analysis_thread(self):
         try:
+            # Берём настройки API из вкладки загрузки
+            load_tab = self.main_app.tabs['load']
+            api_url = load_tab.api_url.get().rstrip('/')
+            token = load_tab.token.get().strip()
+            if not api_url or not token:
+                self.log("Ошибка: не указаны URL или токен API. Перейдите на вкладку 'Загрузка и фильтры' и введите данные.")
+                return
+                
             study_ids = None
             if self.use_filtered.get():
                 filtered_df = self.main_app.get_filtered_data()
                 if filtered_df is None or filtered_df.empty:
-                    self.log("Нет отфильтрованных данных.")
+                    self.log("Нет отфильтрованных данных. Сначала загрузите и отфильтруйте исследования.")
                     return
                 study_ids = filtered_df['study_id'].unique().tolist()
                 if not study_ids:
@@ -237,7 +271,7 @@ class EventLockedTab(BaseTab):
                     
             self.main_app.set_progress(0)
             ts_data = get_event_time_series(
-                self.api_url.get(), self.token.get(),
+                api_url, token,
                 study_ids=study_ids,
                 channel=self.channel.get(),
                 time_from_offset_min=self.time_min.get(),
@@ -253,7 +287,8 @@ class EventLockedTab(BaseTab):
             df = pd.DataFrame(ts_data)
             self.log(f"Загружено {len(df)} временных точек")
             
-            studies = get_studies(self.api_url.get(), self.token.get(), stop_check=lambda: self.stop_flag)
+            # Получаем severity исследований
+            studies = get_studies(api_url, token, stop_check=lambda: self.stop_flag)
             study_severity = {s['study_id']: s.get('breathing_impairment_severity', 'unknown') for s in studies}
             df['severity'] = df['study_id'].map(study_severity)
             df = df.dropna(subset=['severity'])
@@ -338,7 +373,7 @@ class EventLockedTab(BaseTab):
             self.report_btn.config(state=tk.NORMAL)
             self.norm_btn.config(state=tk.NORMAL)
             self.bootstrap_btn.config(state=tk.NORMAL)
-            # заполним комбобоксы
+            # Заполняем комбобоксы
             groups = sorted(self.results_df['severity'].unique())
             self.norm_group_combo['values'] = groups
             self.boot_group1_combo['values'] = groups
@@ -403,58 +438,6 @@ class EventLockedTab(BaseTab):
     # ------------------------------------------------------------
     # Проверка нормальности метрик
     # ------------------------------------------------------------
-    def check_normality_metrics(self):
-        if self.results_df is None or self.results_df.empty:
-            messagebox.showwarning("Нет данных", "Сначала выполните анализ.")
-            return
-        group = self.norm_group.get()
-        metric = self.norm_metric.get()
-        if not group or not metric:
-            messagebox.showwarning("Выбор", "Выберите группу и метрику.")
-            return
-        # Получаем значения метрики для этой группы из сырых кривых пациентов
-        # Для этого нужно иметь доступ к per‑patient значениям
-        # Соберём per‑patient метрики
-        patient_metrics = self._compute_patient_metrics()
-        if patient_metrics is None:
-            self.log("Не удалось собрать per‑patient метрики.")
-            return
-        if group not in patient_metrics:
-            self.log(f"Группа {group} не найдена.")
-            return
-        values = patient_metrics[group][metric].dropna().values
-        if len(values) < 3:
-            self.log(f"Недостаточно данных для группы {group} (n={len(values)}).")
-            return
-        # Тест Шапиро-Уилка
-        if len(values) <= 5000:
-            stat, p = shapiro(values)
-            normal = p > 0.05
-            self.normality_results[f"{group}_{metric}"] = {'p': p, 'n': len(values), 'normal': normal}
-            res_text = f"Группа: {group}, метрика: {metric}\n"
-            res_text += f"Шапиро-Уилк: W={stat:.4f}, p={p:.4e}\n"
-            res_text += "Распределение нормальное" if normal else "Распределение не нормальное"
-        else:
-            self.normality_results[f"{group}_{metric}"] = {'p': None, 'n': len(values), 'normal': None}
-            res_text = f"Группа: {group}, метрика: {metric}\nВыборка >5000, тест не применялся.\nОриентируйтесь на Q-Q plot."
-        # Q-Q plot
-        fig = Figure(figsize=(6,5))
-        ax = fig.add_subplot(111)
-        stats.probplot(values, dist="norm", plot=ax)
-        ax.set_title(f"Q-Q plot: {group} - {metric}")
-        ax.grid(True)
-        # Отображаем в правой панели диагностики
-        for widget in self.diag_plot_frame.winfo_children():
-            widget.destroy()
-        canvas = FigureCanvasTkAgg(fig, master=self.diag_plot_frame)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        self.diag_figure = fig
-        self.diag_text.delete(1.0, tk.END)
-        self.diag_text.insert(tk.END, res_text)
-        self.notebook.select(self.tab_diag)
-        self.log(f"Проверка нормальности для {group} {metric} завершена.")
-        
     def _compute_patient_metrics(self):
         """Возвращает dict: severity -> DataFrame с per-patient метриками"""
         if self.patient_curves is None or self.common_time is None:
@@ -489,6 +472,52 @@ class EventLockedTab(BaseTab):
             result[sev] = sub[['peak_amplitude','peak_latency','auc_0_10','auc_10_30']].copy()
         return result
         
+    def check_normality_metrics(self):
+        if self.results_df is None or self.results_df.empty:
+            messagebox.showwarning("Нет данных", "Сначала выполните анализ.")
+            return
+        group = self.norm_group.get()
+        metric = self.norm_metric.get()
+        if not group or not metric:
+            messagebox.showwarning("Выбор", "Выберите группу и метрику.")
+            return
+        patient_metrics = self._compute_patient_metrics()
+        if patient_metrics is None:
+            self.log("Не удалось собрать per‑patient метрики.")
+            return
+        if group not in patient_metrics:
+            self.log(f"Группа {group} не найдена.")
+            return
+        values = patient_metrics[group][metric].dropna().values
+        if len(values) < 3:
+            self.log(f"Недостаточно данных для группы {group} (n={len(values)}).")
+            return
+        if len(values) <= 5000:
+            stat, p = shapiro(values)
+            normal = p > 0.05
+            self.normality_results[f"{group}_{metric}"] = {'p': p, 'n': len(values), 'normal': normal}
+            res_text = f"Группа: {group}, метрика: {metric}\nШапиро-Уилк: W={stat:.4f}, p={p:.4e}\n"
+            res_text += "Распределение нормальное" if normal else "Распределение не нормальное"
+        else:
+            self.normality_results[f"{group}_{metric}"] = {'p': None, 'n': len(values), 'normal': None}
+            res_text = f"Группа: {group}, метрика: {metric}\nВыборка >5000, тест не применялся.\nОриентируйтесь на Q-Q plot."
+        # Q-Q plot
+        fig = Figure(figsize=(6,5))
+        ax = fig.add_subplot(111)
+        stats.probplot(values, dist="norm", plot=ax)
+        ax.set_title(f"Q-Q plot: {group} - {metric}")
+        ax.grid(True)
+        for widget in self.diag_plot_frame.winfo_children():
+            widget.destroy()
+        canvas = FigureCanvasTkAgg(fig, master=self.diag_plot_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.diag_figure = fig
+        self.diag_text.delete(1.0, tk.END)
+        self.diag_text.insert(tk.END, res_text)
+        self.notebook.select(self.tab_diag)
+        self.log(f"Проверка нормальности для {group} {metric} завершена.")
+        
     # ------------------------------------------------------------
     # Блок-бутстрап для сравнения групп
     # ------------------------------------------------------------
@@ -505,7 +534,6 @@ class EventLockedTab(BaseTab):
         if group1 == group2:
             messagebox.showwarning("Ошибка", "Группы должны различаться.")
             return
-        # Получим per-patient метрики
         patient_metrics = self._compute_patient_metrics()
         if patient_metrics is None:
             return
@@ -532,7 +560,6 @@ class EventLockedTab(BaseTab):
         ci_high = np.percentile(diff_boot, 97.5)
         p = (np.sum(np.abs(diff_boot) < 1e-8) * 2) / len(diff_boot)
         significant = (ci_low > 0 and ci_high > 0) or (ci_low < 0 and ci_high < 0)
-        # Сохраним результат
         key = f"{group1}_vs_{group2}"
         self.bootstrap_results[key] = self.bootstrap_results.get(key, {})
         self.bootstrap_results[key][metric] = {
@@ -545,7 +572,7 @@ class EventLockedTab(BaseTab):
             'n2': len(vals2)
         }
         self._update_bootstrap_table()
-        # Построим гистограмму
+        # Гистограмма
         fig = Figure(figsize=(8,5))
         ax = fig.add_subplot(111)
         ax.hist(diff_boot, bins=50, color='skyblue', edgecolor='black', alpha=0.7)
@@ -557,9 +584,9 @@ class EventLockedTab(BaseTab):
         ax.set_ylabel('Частота')
         ax.set_title(f'Бутстрап распределение разницы: {group1} - {group2}')
         ax.legend()
-        # Показать на вкладке бутстрап
+        # Очищаем предыдущие виджеты в bootstrap_tree_frame, кроме дерева и скролла
         for widget in self.bootstrap_tree_frame.winfo_children():
-            if widget != self.bootstrap_tree and widget != sb:
+            if widget not in (self.bootstrap_tree, sb):
                 widget.destroy()
         canvas = FigureCanvasTkAgg(fig, master=self.bootstrap_tree_frame)
         canvas.draw()
@@ -589,12 +616,10 @@ class EventLockedTab(BaseTab):
         if self.results_df is None or self.summary is None:
             messagebox.showwarning("Нет данных", "Сначала выполните анализ.")
             return
-        # Подготовим данные
         severity_labels = {
             'no_impairment': 'Норма', 'mild': 'Лёгкая', 'moderate': 'Умеренная',
             'severe': 'Тяжёлая', 'central': 'Центральное', 'mixed': 'Смешанное'
         }
-        # Таблица метрик
         metrics_html = self.results_df.to_html(index=False, float_format="%.2f")
         # График в base64
         buf = io.BytesIO()
@@ -607,7 +632,7 @@ class EventLockedTab(BaseTab):
         if self.normality_results:
             norm_html += "<table border='1'><tr><th>Признак</th><th>p-value</th><th>n</th><th>Нормальное</th></tr>"
             for key, val in self.normality_results.items():
-                norm_html += f"<tr><td>{key}</td><td>{val['p']:.4e if val['p'] else '>5000'}</td><td>{val['n']}</td><td>{'Да' if val['normal'] else 'Нет'}</td></tr>"
+                norm_html += f"<tr><td>{key}</td>日起{val['p']:.4e if val['p'] else '>5000'}</td>日起{val['n']}</td>日起{'Да' if val['normal'] else 'Нет'}</td></tr>"
             norm_html += "</table>"
         else:
             norm_html += "<p>Не выполнено.</p>"
@@ -621,7 +646,6 @@ class EventLockedTab(BaseTab):
             boot_html += "</table>"
         else:
             boot_html += "<p>Не выполнено.</p>"
-        # Параметры
         params = f"""
         <p><strong>Канал:</strong> {self.channel.get()}</p>
         <p><strong>Интервал времени:</strong> {self.time_min.get()} … {self.time_max.get()} сек</p>
