@@ -3,6 +3,7 @@ import logging
 import os
 import time
 from typing import Callable, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -71,7 +72,6 @@ def request_with_retry(
     logger.error(f"All {max_retries} attempts failed: {last_exception}")
     return None
 
-
 def paginated_get(
     url: str,
     headers: Dict,
@@ -79,43 +79,52 @@ def paginated_get(
     page_size: int = PAGE_SIZE,
     timeout: int = TIMEOUT,
     stop_check: Optional[Callable[[], bool]] = None,
-    progress_callback: Optional[Callable[[int, int, int], None]] = None
+    progress_callback: Optional[Callable[[int, int, int], None]] = None,
+    max_workers: int = 3  # количество параллельных потоков
 ) -> List[Dict]:
-    """Получает все страницы с проверкой остановки и прогрессом."""
-    all_items = []
-    page = 1
-    total_pages = 1
+    # Загружаем первую страницу, чтобы узнать total_pages
+    query_params = dict(params or {})
+    query_params['limit'] = page_size
+    query_params['page'] = 1
 
-    while True:
+    resp = request_with_retry("GET", url, headers=headers, params=query_params, timeout=timeout)
+    if not resp:
+        return []
+
+    data = resp.json()
+    total_pages = data.get('meta', {}).get('pages', 1)
+    all_items = data.get('data', [])
+
+    if total_pages <= 1:
+        return all_items
+
+    # Параллельная загрузка остальных страниц
+    def fetch_page(page_num):
         if stop_check and stop_check():
-            break
+            return []
+        p_params = dict(params or {})
+        p_params['limit'] = page_size
+        p_params['page'] = page_num
+        resp = request_with_retry("GET", url, headers=headers, params=p_params, timeout=timeout)
+        if resp:
+            return resp.json().get('data', [])
+        return []
 
-        query_params = dict(params or {})
-        query_params['limit'] = page_size
-        query_params['page'] = page
-
-        start_time = time.time()
-        resp = request_with_retry("GET", url, headers=headers, params=query_params, timeout=timeout)
-        if not resp:
-            break
-
-        elapsed = time.time() - start_time
-        logger.info(f"Загружена страница {page} за {elapsed:.1f} сек")
-
-        data = resp.json()
-        items = data.get('data', [])
-        if not items:
-            break
-
-        all_items.extend(items)
-        total_pages = data.get('meta', {}).get('pages', 1)
-
-        if progress_callback:
-            progress_callback(page, total_pages, len(items))
-
-        if page >= total_pages:
-            break
-        page += 1
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_page = {executor.submit(fetch_page, page): page for page in range(2, total_pages + 1)}
+        for future in as_completed(future_to_page):
+            if stop_check and stop_check():
+                executor.shutdown(wait=False, cancel_futures=True)
+                break
+            page = future_to_page[future]
+            try:
+                items = future.result()
+                if items:
+                    all_items.extend(items)
+                if progress_callback:
+                    progress_callback(page, total_pages, len(items))
+            except Exception as e:
+                logger.error(f"Error loading page {page}: {e}")
 
     return all_items
 
