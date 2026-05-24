@@ -26,6 +26,7 @@ import pandas as pd
 import statsmodels.formula.api as smf
 from scipy.stats import false_discovery_control, shapiro, chi2
 from scipy import stats
+from scipy.stats import pearsonr
 import matplotlib
 matplotlib.use('TkAgg')
 from matplotlib.figure import Figure
@@ -49,8 +50,9 @@ class LMMAnalysisTab(BaseTab):
         self.include_covariates = tk.BooleanVar(value=True)
         self.fdr_threshold = tk.DoubleVar(value=0.05)
         self.use_cache = tk.BooleanVar(value=True)
+        self.data_type = tk.IntVar(value=2)  # 1=тонический, 2=все эпохи, 3=фильтр по положению
 
-        # НОВОЕ: выбор типа анализа LMM
+        # выбор типа анализа LMM
         self.analysis_mode = tk.StringVar(value="compare_epochs")  # "compare_epochs" или "tonic_vs_ahi"
 
         # ---- Данные ----
@@ -138,8 +140,7 @@ class LMMAnalysisTab(BaseTab):
         ttk.Radiobutton(mode_frame, text="Тонические признаки vs AHI (хронический эффект)",
                         variable=self.analysis_mode, value="tonic_vs_ahi").pack(anchor=tk.W)
 
-
-
+        self.analysis_mode.trace('w', self._on_analysis_mode_change)
         cache_frame = ttk.LabelFrame(left_frame, text="Кэширование", padding=5)
         cache_frame.pack(fill=tk.X, padx=5, pady=5)
         ttk.Checkbutton(cache_frame, text="Использовать кэш API (ускоряет повторные запуски)",
@@ -207,6 +208,23 @@ class LMMAnalysisTab(BaseTab):
         self.report_btn = ttk.Button(btn_frame, text="Сформировать отчёт", command=self.generate_report, state=tk.DISABLED)
         self.report_btn.pack(side=tk.LEFT, padx=2)
 
+        # ---- График зависимости признака от AHI (только для режима tonic_vs_ahi) ----
+        self.ahi_plot_frame = ttk.LabelFrame(left_frame, text="Визуализация зависимости от AHI", padding=5)
+        self.ahi_plot_frame.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Label(self.ahi_plot_frame, text="Канал:").grid(row=0, column=0, sticky=tk.W, padx=2)
+        self.ahi_channel = tk.StringVar(value='F3')
+        self.ahi_channel_combo = ttk.Combobox(self.ahi_plot_frame, textvariable=self.ahi_channel,
+                                              values=self.all_channels, state='readonly', width=5)
+        self.ahi_channel_combo.grid(row=0, column=1, padx=2)
+        ttk.Label(self.ahi_plot_frame, text="Признак:").grid(row=1, column=0, sticky=tk.W, padx=2)
+        self.ahi_feature = tk.StringVar(value='rel_delta')
+        self.ahi_feature_combo = ttk.Combobox(self.ahi_plot_frame, textvariable=self.ahi_feature,
+                                              values=self.all_features, state='readonly', width=12)
+        self.ahi_feature_combo.grid(row=1, column=1, padx=2)
+        self.ahi_plot_btn = ttk.Button(self.ahi_plot_frame, text="Построить график признак vs AHI",
+                                       command=self.plot_feature_vs_ahi, state=tk.DISABLED)
+        self.ahi_plot_btn.grid(row=2, column=0, columnspan=2, pady=5)
+
         # ---------- Правая панель (внутренний Notebook) ----------
         self.right_notebook = ttk.Notebook(right_frame)
         self.right_notebook.pack(fill=tk.BOTH, expand=True)
@@ -235,6 +253,11 @@ class LMMAnalysisTab(BaseTab):
         self.right_notebook.add(self.tab_diag, text="Диагностика модели")
         self.diag_plot_frame = ttk.Frame(self.tab_diag)
         self.diag_plot_frame.pack(fill=tk.BOTH, expand=True)
+        # ---- Вкладка для графика зависимости от AHI ----
+        self.tab_ahi = ttk.Frame(self.right_notebook)
+        self.right_notebook.add(self.tab_ahi, text="Связь с AHI")
+        self.ahi_plot_inner = ttk.Frame(self.tab_ahi)
+        self.ahi_plot_inner.pack(fill=tk.BOTH, expand=True)
 
     # --------------------------------------------------------------
     # Вспомогательные методы (без изменений)
@@ -245,6 +268,13 @@ class LMMAnalysisTab(BaseTab):
     def stop_analysis(self):
         self.stop_flag = True
         self.log("Остановка LMM запрошена...")
+
+    def _on_analysis_mode_change(self, *args):
+        """При смене режима блокируем/разблокируем кнопку графика AHI."""
+        if self.analysis_mode.get() == 'tonic_vs_ahi' and self.results_df is not None:
+            self.ahi_plot_btn.config(state=tk.NORMAL)
+        else:
+            self.ahi_plot_btn.config(state=tk.DISABLED)
 
     def clear_api_cache(self):
         if os.path.exists(CACHE_API_DIR):
@@ -550,6 +580,36 @@ class LMMAnalysisTab(BaseTab):
         cov['gender_code'] = (cov['gender'] == 'M').astype(int)
         return cov
 
+    def _check_vif(self, df):
+        """Вычисляет VIF для фиксированных эффектов модели."""
+        from statsmodels.stats.outliers_influence import variance_inflation_factor
+        from statsmodels.tools.tools import add_constant
+
+        # Копируем данные
+        data = df.copy()
+        fixed_cols = ['has_apnea']
+        if self.include_stage.get() and 'epoch_stage' in data.columns:
+            stage_dummies = pd.get_dummies(data['epoch_stage'], prefix='stage', drop_first=True)
+            data = pd.concat([data, stage_dummies], axis=1)
+            fixed_cols.extend(stage_dummies.columns)
+        if self.include_covariates.get():
+            for c in ['age_at_study', 'gender_code', 'bmi']:
+                if c in data.columns:
+                    fixed_cols.append(c)
+        # Приводим всё к числовым типам (ошибки заменяем на NaN)
+        vif_df = data[fixed_cols].apply(pd.to_numeric, errors='coerce').dropna()
+        if vif_df.shape[1] < 2:
+            return {}
+        vif_df = add_constant(vif_df)
+        vif_data = {}
+        for i in range(1, len(vif_df.columns)):
+            try:
+                vif_val = variance_inflation_factor(vif_df.values, i)
+                vif_data[vif_df.columns[i]] = vif_val
+            except Exception:
+                vif_data[vif_df.columns[i]] = np.nan
+        return vif_data
+    
     @staticmethod
     def _fit_lmm_model(df, col, channel, feature, include_stage, include_cov):
         cols = [col, 'has_apnea', 'patient_id']
@@ -689,6 +749,7 @@ class LMMAnalysisTab(BaseTab):
             self.results_df = res_df
             self.main_app.root.after(0, self._display_results_table, res_df)
             self.main_app.root.after(0, self._plot_lmm_results, res_df, is_ahi_mode=True)
+            self.main_app.root.after(0, self._on_analysis_mode_change)
             self.save_csv_btn.config(state=tk.NORMAL)
             self.save_plot_btn.config(state=tk.NORMAL)
             self.report_btn.config(state=tk.NORMAL)
@@ -832,6 +893,64 @@ class LMMAnalysisTab(BaseTab):
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.current_figure = fig
+
+    def plot_feature_vs_ahi(self):
+        """Построение scatter-plot среднего значения признака на пациента против AHI с линейной регрессией."""
+        if self.results_df is None or self.analysis_mode.get() != 'tonic_vs_ahi':
+            messagebox.showwarning("Недоступно", "Этот график доступен только в режиме 'Тонические признаки vs AHI' после анализа.")
+            return
+        channel = self.ahi_channel.get()
+        feature = self.ahi_feature.get()
+        col = f"{channel}_{feature}"
+        if col not in self.epochs_df.columns:
+            messagebox.showerror("Ошибка", f"Признак {col} не найден в данных.")
+            return
+        # Получаем AHI для каждого пациента (из filtered_df)
+        filtered_df = self.main_app.get_filtered_data()
+        if filtered_df is None:
+            messagebox.showerror("Ошибка", "Нет отфильтрованных данных.")
+            return
+        # Усредняем признак по пациенту (в тонических эпохах)
+        # Используем self.epochs_df, но ограничиваемся тоническими эпохами (data_type=1)
+        tonic_df = self.epochs_df[self.epochs_df['data_type'] == 1].copy()
+        if tonic_df.empty:
+            messagebox.showerror("Ошибка", "Нет тонических эпох для усреднения.")
+            return
+        # Агрегация по patient_id
+        patient_means = tonic_df.groupby('patient_id')[col].mean().reset_index()
+        # Добавляем AHI (уникальный для пациента)
+        ahi_df = filtered_df[['study_id', 'ahi', 'patient_id']].drop_duplicates(subset=['patient_id'])
+        # Объединяем по patient_id
+        plot_df = patient_means.merge(ahi_df, on='patient_id', how='inner')
+        plot_df = plot_df.dropna(subset=[col, 'ahi'])
+        if plot_df.empty:
+            messagebox.showerror("Ошибка", "Недостаточно данных для построения графика.")
+            return
+        # Линейная регрессия и корреляция
+        x = plot_df['ahi'].values
+        y = plot_df[col].values
+        slope, intercept = np.polyfit(x, y, 1)
+        r, p_val = pearsonr(x, y)
+        # Построение графика
+        fig = Figure(figsize=(8,6), dpi=100)
+        ax = fig.add_subplot(111)
+        ax.scatter(x, y, alpha=0.7, s=40, edgecolors='k', label='Пациенты')
+        x_line = np.array([x.min(), x.max()])
+        y_line = slope * x_line + intercept
+        ax.plot(x_line, y_line, 'r-', label=f'Линейная регрессия: y={slope:.3f}x+{intercept:.2f}')
+        ax.set_xlabel('AHI (событий/час)')
+        ax.set_ylabel(f'{feature} ({channel})')
+        ax.set_title(f'Зависимость {feature} от AHI (тонические эпохи)\nr = {r:.3f}, p = {p_val:.2e}')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        # Очистить вкладку и отобразить
+        for widget in self.ahi_plot_inner.winfo_children():
+            widget.destroy()
+        canvas = FigureCanvasTkAgg(fig, master=self.ahi_plot_inner)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.right_notebook.select(self.tab_ahi)
+        self.log(f"Построен график {channel}_{feature} vs AHI, r={r:.3f}, p={p_val:.2e}")
 
     # --------------------------------------------------------------
     # Диагностика остатков (адаптирована под оба режима)

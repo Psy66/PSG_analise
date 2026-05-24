@@ -1,55 +1,65 @@
 # ui/tab_pca.py
+"""
+Анализ главных компонент (PCA) и иерархическая кластеризация пациентов
+в соответствии с Главой 2 (п. 2.5.4 и 2.5.5).
+
+- PCA и стандартизация на тонических эпохах (data_type=1)
+- Проецирование смешанных эпох (data_type=2) на компоненты
+- LMM для PC1..PCn: фиксированные эффекты has_apnea, стадия сна, возраст, пол, ИМТ
+- ROC для значимых PC
+- Кластеризация пациентов по средним PC1 и PC2 (Уорд, евклид)
+- Бутстрап устойчивости, сравнение кластеров
+- Отчёт с уравнениями регрессии
+"""
+
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
+import warnings
 import os
 import tempfile
 import webbrowser
-import io
 import base64
+import io
 import numpy as np
 import pandas as pd
+from scipy.stats import false_discovery_control, chi2_contingency, f_oneway
+from scipy.cluster.hierarchy import linkage, fcluster, dendrogram
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import silhouette_score, adjusted_rand_score, roc_curve, roc_auc_score
+import statsmodels.formula.api as smf
 import matplotlib
 matplotlib.use('TkAgg')
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import matplotlib.pyplot as plt
-from sklearn.decomposition import PCA
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score, roc_curve
-from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import StandardScaler
-from scipy.stats import shapiro, false_discovery_control
-import statsmodels.formula.api as smf
-from scipy import stats
-
 from ui.base_tab import BaseTab
 from core.api_client import get_epochs
+from core.config import CACHE_API_DIR
+
+warnings.filterwarnings("ignore", module="statsmodels")
+warnings.filterwarnings("ignore", category=UserWarning)
+
 
 class PCAAnalysisTab(BaseTab):
     def __init__(self, parent, main_app):
         super().__init__(parent, main_app)
-        # Настройки
-        self.data_type = tk.IntVar(value=2)
-        self.use_filtered = tk.BooleanVar(value=True)
+        # ---- Параметры ----
+        self.pca_data_type = tk.IntVar(value=1)       # 1 = тонические (для обучения PCA)
+        self.lmm_data_type = tk.IntVar(value=2)       # 2 = все эпохи (для LMM)
         self.n_components = tk.IntVar(value=5)
-        self.scale_data = tk.BooleanVar(value=True)
-        self.use_logreg = tk.BooleanVar(value=True)
-        self.logreg_cv_folds = tk.IntVar(value=5)
+        self.fdr_threshold = tk.DoubleVar(value=0.05)
+        self.include_stage = tk.BooleanVar(value=True)
+        self.include_covariates = tk.BooleanVar(value=True)
+        self.use_filtered = tk.BooleanVar(value=True)
         self.use_cache = tk.BooleanVar(value=True)
-        self.exclude_central_mixed = tk.BooleanVar(value=True)
-        
         self.stop_flag = False
-        self.results = None            # словарь с pca, X_pca, y, feature_names, ...
+
+        # ---- Данные ----
+        self.results = None
         self.current_figure = None
-        self.lmm_results = None        # результаты LMM для PC
-        
-        # Для диагностики и бутстрапа
-        self.normality_results = {}    # {PC: p_value}
-        self.bootstrap_loadings = None
-        self.pca_model = None
-        self.feature_names = None
-        
+
+        # ---- Признаки (для информации) ----
         self.all_channels = ['F3', 'C3', 'O1', 'F4', 'C4', 'O2']
         self.all_features = [
             'mean', 'std', 'min', 'max', 'range', 'rms',
@@ -57,736 +67,683 @@ class PCAAnalysisTab(BaseTab):
             'abs_alpha', 'rel_alpha', 'abs_sigma', 'rel_sigma',
             'abs_beta', 'rel_beta', 'tbr', 'dar', 'se50', 'gamma_power', 'sampen'
         ]
-        self.saved_channels_selection = []
-        self.saved_features_selection = []
-        
+        self.coh_pairs = [('F3','C3'),('F3','F4'),('F3','C4'),('C3','C4'),('C3','O1'),
+                          ('F4','C4'),('O1','O2'),('C3','O2')]
+        self.coh_bands = ['delta','theta','alpha','sigma','beta','gamma']
+
         self._create_widgets()
-        
-    # ------------------------------------------------------------
-    # Построение интерфейса
-    # ------------------------------------------------------------
+
     def _create_widgets(self):
         main_container = ttk.Frame(self)
         main_container.pack(fill=tk.BOTH, expand=True)
-        
-        canvas = tk.Canvas(main_container, borderwidth=0, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(main_container, orient=tk.VERTICAL, command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        inner = ttk.Frame(canvas)
-        canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        
-        paned = ttk.PanedWindow(inner, orient=tk.HORIZONTAL)
+
+        paned = ttk.PanedWindow(main_container, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
-        
+
         left_frame = ttk.Frame(paned)
-        paned.add(left_frame, weight=1)
         right_frame = ttk.Frame(paned)
-        paned.add(right_frame, weight=2)
-        
-        # ========== ЛЕВАЯ ПАНЕЛЬ ==========
-        info_frame = ttk.LabelFrame(left_frame, text="Источник данных", padding=5)
+        paned.add(left_frame, weight=1)
+        paned.add(right_frame, weight=3)
+
+        # ========== Левая панель ==========
+        info_frame = ttk.LabelFrame(left_frame, text="Описание анализа", padding=5)
         info_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(info_frame, text="Используются отфильтрованные данные из вкладки 'Загрузка'",
-                  foreground="blue").pack(anchor=tk.W)
-        ttk.Label(info_frame, text="(токен и URL не требуются)").pack(anchor=tk.W)
-        
-        desc_frame = ttk.LabelFrame(left_frame, text="Что такое PCA (Глава 2, п. 2.5.4)?", padding=5)
-        desc_frame.pack(fill=tk.X, padx=5, pady=5)
-        desc_text = (
-            "Анализ главных компонент (PCA) снижает размерность 180 ЭЭГ-признаков до 5 интегральных компонент, "
-            "объясняющих >70% дисперсии. Затем:\n"
-            "• Строятся линейные смешанные модели (LMM) для каждой ПК с фиксированным эффектом has_apnea.\n"
-            "• Выполняется логистическая регрессия на ПК для классификации эпох (AUC ≥ 0.85).\n"
-            "• Проводится бутстрап нагрузок для оценки устойчивости.\n"
-            "• Иерархическая кластеризация пациентов на основе PC1/PC2 (выявляет скрытые фенотипы)."
-        )
-        ttk.Label(desc_frame, text=desc_text, justify=tk.LEFT, wraplength=600).pack(anchor=tk.W, fill=tk.X, padx=5, pady=2)
-        ttk.Button(desc_frame, text="Показать инструкцию", command=self.show_instructions).pack(anchor=tk.W, padx=5, pady=2)
-        
-        # Данные
-        type_frame = ttk.LabelFrame(left_frame, text="Данные", padding=5)
-        type_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(type_frame, text="Тип набора (data_type):").grid(row=0, column=0, sticky=tk.W)
-        ttk.Combobox(type_frame, textvariable=self.data_type, values=[1,2,3], state='readonly', width=5).grid(row=0, column=1, padx=5)
-        ttk.Label(type_frame, text="1=тонический, 2=все эпохи, 3=фильтр по положению").grid(row=0, column=2, sticky=tk.W)
-        ttk.Checkbutton(type_frame, text="Использовать отфильтрованные исследования", variable=self.use_filtered).grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=5)
-        ttk.Checkbutton(type_frame, text="Исключить центральное/смешанное апноэ", variable=self.exclude_central_mixed).grid(row=2, column=0, columnspan=3, sticky=tk.W)
-        ttk.Checkbutton(type_frame, text="Использовать кэш", variable=self.use_cache).grid(row=3, column=0, columnspan=3, sticky=tk.W)
-        
-        # Выбор признаков
-        select_frame = ttk.LabelFrame(left_frame, text="Выбор признаков", padding=5)
-        select_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(select_frame, text="Каналы (Ctrl/Shift):").grid(row=0, column=0, sticky=tk.W)
-        self.channels_listbox = tk.Listbox(select_frame, selectmode=tk.EXTENDED, height=6, width=20)
-        for ch in self.all_channels:
-            self.channels_listbox.insert(tk.END, ch)
-        self.channels_listbox.selection_set(0, tk.END)
-        self.channels_listbox.grid(row=1, column=0, padx=5, sticky=tk.W)
-        self.channels_listbox.bind('<<ListboxSelect>>', self.save_channels_selection)
-        
-        ttk.Label(select_frame, text="Признаки (Ctrl/Shift):").grid(row=0, column=1, sticky=tk.W)
-        self.features_listbox = tk.Listbox(select_frame, selectmode=tk.EXTENDED, height=12, width=30)
-        for feat in self.all_features:
-            self.features_listbox.insert(tk.END, feat)
-        self.features_listbox.selection_set(0, tk.END)
-        self.features_listbox.grid(row=1, column=1, padx=5, sticky=tk.W)
-        self.features_listbox.bind('<<ListboxSelect>>', self.save_features_selection)
-        
-        # Параметры PCA
-        pca_frame = ttk.LabelFrame(left_frame, text="Параметры PCA", padding=5)
-        pca_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(pca_frame, text="Число компонент:").grid(row=0, column=0, sticky=tk.W)
-        ttk.Spinbox(pca_frame, from_=2, to=50, textvariable=self.n_components, width=5).grid(row=0, column=1, padx=5)
-        ttk.Checkbutton(pca_frame, text="Масштабировать признаки (StandardScaler)", variable=self.scale_data).grid(row=1, column=0, columnspan=2, sticky=tk.W)
-        
-        # Логистическая регрессия
-        class_frame = ttk.LabelFrame(left_frame, text="Логистическая регрессия на ПК", padding=5)
-        class_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Checkbutton(class_frame, text="Выполнить логистическую регрессию", variable=self.use_logreg).grid(row=0, column=0, columnspan=2, sticky=tk.W)
-        ttk.Label(class_frame, text="Число фолдов (CV по пациентам):").grid(row=1, column=0, sticky=tk.W)
-        ttk.Spinbox(class_frame, from_=2, to=10, textvariable=self.logreg_cv_folds, width=3).grid(row=1, column=1, padx=5)
-        
-        # Диагностика и бутстрап
-        diag_frame = ttk.LabelFrame(left_frame, text="Диагностика и бутстрап", padding=5)
-        diag_frame.pack(fill=tk.X, padx=5, pady=5)
-        self.norm_btn = ttk.Button(diag_frame, text="Проверить нормальность PC1-PC5", command=self.check_normality, state=tk.DISABLED)
-        self.norm_btn.pack(anchor=tk.W, pady=2)
-        self.bootstrap_btn = ttk.Button(diag_frame, text="Бутстрап нагрузок (100 итер.)", command=self.run_bootstrap, state=tk.DISABLED)
-        self.bootstrap_btn.pack(anchor=tk.W, pady=2)
-        self.save_bootstrap_btn = ttk.Button(diag_frame, text="Сохранить бутстрап (CSV)", command=self.save_bootstrap_csv, state=tk.DISABLED)
-        self.save_bootstrap_btn.pack(anchor=tk.W, pady=2)
-        
-        # Кнопки
+        desc_text = ("PCA снижает размерность 180 ЭЭГ-признаков.\n"
+                     "Обучение PCA на тонических эпохах (data_type=1).\n"
+                     "LMM для PC выполняется на смешанных эпохах (data_type=2).\n"
+                     "Кластеризация пациентов по средним PC1 и PC2.")
+        ttk.Label(info_frame, text=desc_text, wraplength=400, justify=tk.LEFT).pack(anchor=tk.W, pady=2)
+        ttk.Button(info_frame, text="Показать инструкцию", command=self.show_instructions).pack(anchor=tk.W, pady=2)
+
+        settings_frame = ttk.LabelFrame(left_frame, text="Настройки", padding=5)
+        settings_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        ttk.Label(settings_frame, text="Тип эпох для PCA:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Combobox(settings_frame, textvariable=self.pca_data_type, values=[1,2,3], state='readonly', width=5).grid(row=0, column=1, padx=5)
+        ttk.Label(settings_frame, text="1=тонич., 2=все, 3=полож.").grid(row=0, column=2, sticky=tk.W)
+
+        ttk.Label(settings_frame, text="Тип эпох для LMM:").grid(row=1, column=0, sticky=tk.W)
+        ttk.Combobox(settings_frame, textvariable=self.lmm_data_type, values=[1,2,3], state='readonly', width=5).grid(row=1, column=1, padx=5)
+        ttk.Label(settings_frame, text="Должен содержать эпохи с апноэ (рекоменд. 2)").grid(row=1, column=2, sticky=tk.W)
+
+        ttk.Label(settings_frame, text="Число компонент:").grid(row=2, column=0, sticky=tk.W)
+        ttk.Spinbox(settings_frame, from_=2, to=20, textvariable=self.n_components, width=5).grid(row=2, column=1, padx=5)
+
+        ttk.Label(settings_frame, text="Порог FDR (q):").grid(row=3, column=0, sticky=tk.W)
+        ttk.Entry(settings_frame, textvariable=self.fdr_threshold, width=6).grid(row=3, column=1, padx=5)
+
+        ttk.Checkbutton(settings_frame, text="Включить стадию сна в LMM", variable=self.include_stage).grid(row=4, column=0, columnspan=3, sticky=tk.W)
+        ttk.Checkbutton(settings_frame, text="Включить ковариаты (возраст, пол, ИМТ)", variable=self.include_covariates).grid(row=5, column=0, columnspan=3, sticky=tk.W)
+        ttk.Checkbutton(settings_frame, text="Использовать отфильтрованные исследования", variable=self.use_filtered).grid(row=6, column=0, columnspan=3, sticky=tk.W)
+        ttk.Checkbutton(settings_frame, text="Использовать кэш API", variable=self.use_cache).grid(row=7, column=0, columnspan=3, sticky=tk.W)
+
         btn_frame = ttk.Frame(left_frame)
         btn_frame.pack(fill=tk.X, padx=5, pady=10)
-        self.run_btn = ttk.Button(btn_frame, text="Запустить PCA", command=self.run_pca)
-        self.run_btn.pack(side=tk.LEFT, padx=5)
+        self.run_btn = ttk.Button(btn_frame, text="Запустить PCA и кластеризацию", command=self.run_analysis)
+        self.run_btn.pack(side=tk.LEFT, padx=2)
         self.stop_btn = ttk.Button(btn_frame, text="Остановить", command=self.stop_analysis, state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.LEFT, padx=5)
-        self.save_csv_btn = ttk.Button(btn_frame, text="Сохранить координаты ПК (CSV)", command=self.save_results_csv, state=tk.DISABLED)
-        self.save_csv_btn.pack(side=tk.LEFT, padx=5)
-        self.save_plot_btn = ttk.Button(btn_frame, text="Сохранить график (PNG)", command=self.save_plot, state=tk.DISABLED)
-        self.save_plot_btn.pack(side=tk.LEFT, padx=5)
+        self.stop_btn.pack(side=tk.LEFT, padx=2)
+        self.save_csv_btn = ttk.Button(btn_frame, text="Сохранить CSV", command=self.save_results_csv, state=tk.DISABLED)
+        self.save_csv_btn.pack(side=tk.LEFT, padx=2)
+        self.save_plot_btn = ttk.Button(btn_frame, text="Сохранить график", command=self.save_plot, state=tk.DISABLED)
+        self.save_plot_btn.pack(side=tk.LEFT, padx=2)
         self.report_btn = ttk.Button(btn_frame, text="Сформировать отчёт", command=self.generate_report, state=tk.DISABLED)
-        self.report_btn.pack(side=tk.LEFT, padx=5)
-        
-        # ========== ПРАВАЯ ПАНЕЛЬ ==========
+        self.report_btn.pack(side=tk.LEFT, padx=2)
+
+        # ========== Правая панель ==========
         self.notebook = ttk.Notebook(right_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        self.tab_scatter = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_scatter, text="Scatter plot (PC1/PC2)")
-        self.tab_variance = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_variance, text="Explained variance")
-        self.tab_loadings = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_loadings, text="Loadings heatmap")
-        self.tab_roc = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_roc, text="ROC curves")
-        self.tab_coef = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_coef, text="LogReg coefficients")
-        self.tab_diag = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_diag, text="Диагностика")
+
+        self.tab_pca = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_pca, text="Графики PCA")
+        self.pca_frame = ttk.Frame(self.tab_pca)
+        self.pca_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.tab_clusters = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_clusters, text="Кластеризация")
+        self.cluster_frame = ttk.Frame(self.tab_clusters)
+        self.cluster_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.tab_stats = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_stats, text="Статистика")
+        self.stats_frame = ttk.Frame(self.tab_stats)
+        self.stats_frame.pack(fill=tk.BOTH, expand=True)
+        self.stats_tree = ttk.Treeview(self.stats_frame, show='headings')
+        self.stats_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(self.stats_frame, orient=tk.VERTICAL, command=self.stats_tree.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.stats_tree.configure(yscrollcommand=sb.set)
+
         self.tab_log = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_log, text="Лог выполнения")
-        
-        self.plot_frames = {
-            'scatter': self.tab_scatter,
-            'variance': self.tab_variance,
-            'loadings': self.tab_loadings,
-            'roc': self.tab_roc,
-            'coef': self.tab_coef
-        }
-        for frame in self.plot_frames.values():
-            ttk.Frame(frame).pack(fill=tk.BOTH, expand=True)
-        
-        self.diag_text = tk.Text(self.tab_diag, wrap=tk.WORD, font=("Courier New", 9), height=10)
-        self.diag_text.pack(fill=tk.X, padx=5, pady=5)
-        self.diag_plot_frame = ttk.Frame(self.tab_diag)
-        self.diag_plot_frame.pack(fill=tk.BOTH, expand=True)
-        
+        self.notebook.add(self.tab_log, text="Лог")
         self.log_text = tk.Text(self.tab_log, wrap=tk.WORD, font=("Courier New", 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
-        
-        self._clear_coef_tab()
-        
-    # ------------------------------------------------------------
-    # Вспомогательные методы
-    # ------------------------------------------------------------
+
     def log(self, msg):
         self.log_text.insert(tk.END, msg + "\n")
         self.log_text.see(tk.END)
         self.main_app.log(msg)
-        
+
     def stop_analysis(self):
         self.stop_flag = True
         self.log("Остановка запрошена...")
-        
+
     def show_instructions(self):
         msg = (
-            "ИНСТРУКЦИЯ ПО PCA АНАЛИЗУ (Глава 2, п. 2.5.4 – 2.5.5)\n"
-            "====================================================\n"
+            "ИНСТРУКЦИЯ ПО PCA И КЛАСТЕРИЗАЦИИ (Глава 2, п. 2.5.4, 2.5.5)\n"
+            "===========================================================\n"
             "1. Загрузите и отфильтруйте данные на вкладке 'Загрузка и фильтры'.\n"
-            "2. Выберите каналы и признаки (по умолчанию – все).\n"
-            "3. Установите число главных компонент (рекомендуется 5).\n"
-            "4. Нажмите 'Запустить PCA'. Будут построены:\n"
-            "   - Scatter plot PC1 vs PC2 (апноэ/без апноэ)\n"
-            "   - Scree plot (объяснённая дисперсия)\n"
-            "   - Тепловая карта нагрузок (топ-20 признаков)\n"
-            "5. Если включена логистическая регрессия, выполняется ROC-анализ.\n"
-            "6. После завершения можно проверить нормальность PC и запустить бутстрап нагрузок.\n"
-            "7. Кнопка 'Сформировать отчёт' создаст HTML-отчёт с уравнением регрессии,\n"
-            "   результатами LMM для ПК и интерпретацией.\n"
-            "8. Результаты можно сохранить в CSV (координаты ПК) и PNG (графики)."
+            "2. Настройте параметры:\n"
+            "   - Тип эпох для PCA (рекомендуется 1 – тонические)\n"
+            "   - Тип эпох для LMM (рекомендуется 2 – все эпохи, чтобы были апноэ)\n"
+            "   - Число компонент, FDR, включение ковариат.\n"
+            "3. Нажмите 'Запустить PCA и кластеризацию'.\n"
+            "4. Результаты:\n"
+            "   - Графики: проекция PC1/PC2, scree plot, loadings, ROC-кривые\n"
+            "   - Кластеризация: дендрограмма, распределение кластеров\n"
+            "   - Статистика: LMM для PC, сравнение кластеров\n"
+            "5. Кнопки 'Сохранить CSV' сохраняют координаты PC и метрики кластеров.\n"
+            "6. 'Сформировать отчёт' создаёт HTML-отчёт с интерпретацией и уравнениями регрессии.\n"
         )
         messagebox.showinfo("Инструкция", msg)
-        
-    def save_channels_selection(self, event=None):
-        self.saved_channels_selection = list(self.channels_listbox.curselection())
-        
-    def save_features_selection(self, event=None):
-        self.saved_features_selection = list(self.features_listbox.curselection())
-        
-    def restore_selections(self):
-        self.channels_listbox.selection_clear(0, tk.END)
-        for idx in self.saved_channels_selection:
-            self.channels_listbox.selection_set(idx)
-        self.features_listbox.selection_clear(0, tk.END)
-        for idx in self.saved_features_selection:
-            self.features_listbox.selection_set(idx)
-            
-    def on_tab_selected(self):
-        self.restore_selections()
-        
-    # ------------------------------------------------------------
-    # Загрузка данных
-    # ------------------------------------------------------------
-    def _load_epochs(self):
-        load_tab = self.main_app.tabs['load']
-        api_url = load_tab.api_url.get().rstrip('/')
-        token = load_tab.token.get().strip()
-        if not api_url or not token:
-            self.log("Ошибка: не указаны URL или токен API. Перейдите на вкладку 'Загрузка'.")
-            return None
-            
-        study_ids = None
-        if self.use_filtered.get():
-            filtered_df = self.main_app.get_filtered_data()
-            if filtered_df is None or filtered_df.empty:
-                self.log("Нет отфильтрованных данных.")
-                return None
-            study_ids = filtered_df['study_id'].unique().tolist()
-            if not study_ids:
-                self.log("В отфильтрованных данных нет study_id.")
-                return None
-                
-        if self.exclude_central_mixed.get():
-            filtered_df = self.main_app.get_filtered_data()
-            if filtered_df is not None:
-                allowed = ['no_impairment', 'mild', 'moderate', 'severe']
-                filtered_df = filtered_df[filtered_df['breathing_impairment_severity'].isin(allowed)]
-                if not filtered_df.empty:
-                    study_ids = filtered_df['study_id'].unique().tolist()
-                    self.log(f"После исключения центрального/смешанного апноэ: {len(study_ids)} исследований")
-                    
-        def update_progress(page, total, _):
-            if total > 0:
-                self.main_app.set_progress(int(page / total * 100))
-                
-        self.main_app.set_progress(0)
-        self.log("Загрузка эпох...")
-        epochs = get_epochs(
-            api_url, token,
-            study_ids=study_ids,
-            data_type=self.data_type.get(),
-            stop_check=lambda: self.stop_flag,
-            progress_callback=update_progress,
-            use_cache=self.use_cache.get()
-        )
-        self.main_app.set_progress(100)
-        if not epochs:
-            return None
-        df = pd.DataFrame(epochs)
-        self.log(f"Загружено {len(df)} эпох")
-        return df
-        
-    # ------------------------------------------------------------
-    # Основной PCA
-    # ------------------------------------------------------------
-    def run_pca(self):
+
+    def run_analysis(self):
         self.stop_flag = False
         self.run_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         self.save_csv_btn.config(state=tk.DISABLED)
         self.save_plot_btn.config(state=tk.DISABLED)
         self.report_btn.config(state=tk.DISABLED)
-        self.norm_btn.config(state=tk.DISABLED)
-        self.bootstrap_btn.config(state=tk.DISABLED)
-        self.save_bootstrap_btn.config(state=tk.DISABLED)
-        self.log("Запуск PCA...")
-        thread = threading.Thread(target=self._run_pca_thread)
-        thread.daemon = True
-        thread.start()
-        
-    def _run_pca_thread(self):
+        self.log("Загрузка данных...")
+        threading.Thread(target=self._run_analysis_thread, daemon=True).start()
+
+    def _run_analysis_thread(self):
+
         try:
-            df = self._load_epochs()
-            if df is None or self.stop_flag:
+            self.results = {}
+            load_tab = self.main_app.tabs['load']
+            api_url = load_tab.api_url.get().rstrip('/')
+            token = load_tab.token.get().strip()
+            if not api_url or not token:
+                self.log("Ошибка: не указаны URL или токен API. Перейдите на вкладку 'Загрузка и фильтры'.")
                 return
-                
-            # Выбор признаков
-            selected_channels = [self.channels_listbox.get(i) for i in self.channels_listbox.curselection()]
-            selected_features = [self.features_listbox.get(i) for i in self.features_listbox.curselection()]
-            if not selected_channels:
-                selected_channels = self.all_channels[:]
-            if not selected_features:
-                selected_features = self.all_features[:]
-                
+
+            study_ids = None
+            if self.use_filtered.get():
+                filtered_df = self.main_app.get_filtered_data()
+                if filtered_df is None or filtered_df.empty:
+                    self.log("Нет отфильтрованных данных. Сначала примените фильтры во вкладке 'Загрузка'.")
+                    return
+                study_ids = filtered_df['study_id'].unique().tolist()
+                self.log(f"Используем {len(study_ids)} исследований (после фильтрации)")
+
+            # ---------- 1. Загрузка тонических эпох для PCA ----------
+            def update_progress(page, total, _):
+                if total > 0:
+                    self.main_app.set_progress(int(page / total * 100))
+
+            self.main_app.set_progress(0)
+            self.log(f"Загрузка тонических эпох (data_type={self.pca_data_type.get()}) для PCA...")
+            epochs_pca = get_epochs(
+                api_url, token,
+                study_ids=study_ids,
+                data_type=self.pca_data_type.get(),
+                stop_check=lambda: self.stop_flag,
+                progress_callback=update_progress,
+                use_cache=self.use_cache.get()
+            )
+            if not epochs_pca or self.stop_flag:
+                self.log("Нет данных для PCA.")
+                return
+            df_pca = pd.DataFrame(epochs_pca)
+            self.log(f"Загружено {len(df_pca)} эпох для PCA")
+
+            # ---------- 2. Загрузка смешанных эпох для LMM ----------
+            self.log(f"Загрузка эпох для LMM (data_type={self.lmm_data_type.get()})...")
+            epochs_lmm = get_epochs(
+                api_url, token,
+                study_ids=study_ids,
+                data_type=self.lmm_data_type.get(),
+                stop_check=lambda: self.stop_flag,
+                progress_callback=update_progress,
+                use_cache=self.use_cache.get()
+            )
+            if not epochs_lmm or self.stop_flag:
+                self.log("Нет данных для LMM.")
+                return
+            df_lmm = pd.DataFrame(epochs_lmm)
+            self.log(f"Загружено {len(df_lmm)} эпох для LMM")
+
+            # ---------- 3. Построение списка признаков (на основе df_pca) ----------
             feature_cols = []
-            for ch in selected_channels:
-                for feat in selected_features:
+            for ch in self.all_channels:
+                for feat in self.all_features:
                     col = f"{ch}_{feat}"
-                    if col in df.columns:
+                    if col in df_pca.columns:
                         feature_cols.append(col)
-                    else:
-                        self.log(f"Предупреждение: столбец {col} не найден, пропущен")
-            if not feature_cols:
+            for a, b in self.coh_pairs:
+                pair = f"{a}{b}"
+                for band in self.coh_bands:
+                    col = f"{pair}_coh_{band}"
+                    if col in df_pca.columns:
+                        feature_cols.append(col)
+            for ch in self.all_channels:
+                col = f"{ch}_dfa"
+                if col in df_pca.columns:
+                    feature_cols.append(col)
+            feature_cols = list(set(feature_cols))
+            self.log(f"Всего признаков: {len(feature_cols)}")
+            if len(feature_cols) == 0:
                 self.log("Нет доступных признаков.")
                 return
-            self.log(f"Используется признаков: {len(feature_cols)}")
-            
-            X = df[feature_cols].copy()
-            X = X.dropna()
-            if len(X) < 10:
-                self.log("Слишком мало строк после удаления NaN.")
+
+            # ---------- 4. Обучение PCA на тонических эпохах ----------
+            X_pca = df_pca[feature_cols].copy()
+            X_pca = X_pca.dropna()
+            if len(X_pca) < 10:
+                self.log("Слишком мало строк после удаления NaN в PCA-выборке.")
                 return
-            meta = df.loc[X.index, ['patient_id', 'has_apnea', 'epoch_stage']].copy()
-            y = meta['has_apnea'].astype(int)
-            patients = meta['patient_id'].values
-            self.log(f"Матрица X: {X.shape}, эпох с апноэ: {y.sum()}")
-            
-            # Масштабирование
-            if self.scale_data.get():
-                scaler = StandardScaler()
-                X_scaled = scaler.fit_transform(X)
-            else:
-                scaler = None
-                X_scaled = X.values
-                
+            self.log(f"Матрица X для PCA: {X_pca.shape}")
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X_pca)
             n_comp = min(self.n_components.get(), X_scaled.shape[1], X_scaled.shape[0])
             pca = PCA(n_components=n_comp)
-            X_pca = pca.fit_transform(X_scaled)
-            self.log(f"PCA выполнено, сохранено {n_comp} компонент, объяснённая дисперсия: {pca.explained_variance_ratio_.sum():.3f}")
-            
-            # LMM для каждой PC
-            lmm_results = self._run_lmm_for_pcs(X_pca, meta, n_comp)
-            self.lmm_results = lmm_results
-            
-            # Логистическая регрессия
-            logreg_results = None
-            if self.use_logreg.get():
-                logreg_results = self._run_logistic_regression(X_pca, y, patients, pca, feature_cols)
-                
-            self.results = {
+            X_pca_transformed = pca.fit_transform(X_scaled)
+            self.log(f"PCA обучено, объяснённая дисперсия: {pca.explained_variance_ratio_.sum():.3f}")
+            self.log(f"Доли дисперсии: {pca.explained_variance_ratio_}")
+
+            # ---------- 5. Проецирование LMM-эпох на те же компоненты ----------
+            X_lmm = df_lmm[feature_cols].copy()
+            X_lmm = X_lmm.dropna()
+            if len(X_lmm) < 30:
+                self.log("Слишком мало строк для LMM.")
+                return
+            # Применяем тот же scaler и PCA
+            X_lmm_scaled = scaler.transform(X_lmm)   # используем .transform, а не fit_transform
+            X_lmm_pca = pca.transform(X_lmm_scaled)
+            meta_lmm = df_lmm.loc[X_lmm.index, ['patient_id', 'study_id', 'has_apnea', 'epoch_stage']].copy()
+            y_lmm = meta_lmm['has_apnea'].astype(int)
+            self.log(f"Матрица для LMM: {X_lmm.shape}, эпох с апноэ: {y_lmm.sum()}")
+
+            # Сохраняем индексы для кластеризации
+            pca_idx = X_pca.index  # X_pca - DataFrame после dropna
+            pca_patient_ids = df_pca.loc[pca_idx, 'patient_id'].values
+            pca_pc_df = pd.DataFrame({
+                'patient_id': pca_patient_ids,
+                'PC1': X_pca_transformed[:, 0],
+                'PC2': X_pca_transformed[:, 1]
+            })
+            self.results['pca_pc_df'] = pca_pc_df
+
+            # Сохраняем объекты для дальнейшего
+            self.results.update({
                 'pca': pca,
-                'X_pca': X_pca,
-                'meta': meta,
-                'y': y,
-                'feature_names': feature_cols,
                 'scaler': scaler,
-                'n_comp': n_comp,
-                'lmm_results': lmm_results,
-                'logreg_results': logreg_results
-            }
-            
-            # Визуализация
-            self._plot_scatter(X_pca, meta)
-            self._plot_variance(pca)
-            self._plot_loadings(pca, feature_cols, n_comp)
-            if logreg_results:
-                self._display_coef_table(logreg_results['coef_df'], logreg_results['intercept'])
-                self._plot_roc_curves(y, X_pca, logreg_results)
-            else:
-                self._clear_coef_tab()
-                
+                'feature_names': feature_cols,
+                'n_components': n_comp,
+                'pca_epochs': X_pca.shape[0],
+                'lmm_epochs': X_lmm.shape[0]
+            })
+
+            # ---------- 6. LMM для PC на смешанных эпохах ----------
+            self._lmm_for_pcs(X_lmm_pca, meta_lmm)
+
+            # ---------- 7. ROC для значимых PC ----------
+            if 'lmm' in self.results and not self.results['lmm'].empty:
+                self._roc_for_significant_pcs(X_lmm_pca, y_lmm)
+
+            # ---------- 8. Кластеризация пациентов по средним PC1 и PC2 (на тонических эпохах) ----------
+            self._cluster_patients(pca_pc_df)
+
+            # ---------- 9. Визуализация ----------
+            self._plot_pca_results(pca, X_pca_transformed, X_lmm_pca, y_lmm)
+            self._plot_cluster_results()
+
+            # ---------- 10. Отображение статистики ----------
+            self._display_stats_table()
+
             self.save_csv_btn.config(state=tk.NORMAL)
             self.save_plot_btn.config(state=tk.NORMAL)
             self.report_btn.config(state=tk.NORMAL)
-            self.norm_btn.config(state=tk.NORMAL)
-            self.bootstrap_btn.config(state=tk.NORMAL)
-            self.log("PCA анализ завершён.")
-            
+            self.log("Анализ завершён.")
+
         except Exception as e:
             self.log(f"Ошибка: {e}")
+            import traceback
+            self.log(traceback.format_exc())
         finally:
             self.run_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
-            
-    def _run_lmm_for_pcs(self, X_pca, meta, n_comp):
-        """Строит LMM для каждой PC: PC ~ has_apnea + (1|patient_id)"""
-        results = []
-        df_pcs = pd.DataFrame(X_pca, columns=[f'PC{i+1}' for i in range(n_comp)])
-        df_pcs['has_apnea'] = meta['has_apnea'].astype(bool)
-        df_pcs['patient_id'] = meta['patient_id'].astype(int)
-        for i in range(n_comp):
-            col = f'PC{i+1}'
+            self.main_app.set_progress(0)
+
+    def _lmm_for_pcs(self, X_pca, meta):
+        # Получаем ковариаты из отфильтрованных данных
+        filtered_df = self.main_app.get_filtered_data()
+        if filtered_df is None or filtered_df.empty:
+            self.log("Нет отфильтрованных данных для ковариат.")
+            cov_df = None
+        else:
+            cov_df = filtered_df[['study_id', 'age_at_study', 'gender', 'bmi']].drop_duplicates(subset=['study_id'])
+            cov_df['gender_code'] = (cov_df['gender'] == 'M').astype(int)
+            cov_df = cov_df[['study_id', 'age_at_study', 'gender_code', 'bmi']]
+
+        meta = meta.copy()
+        if cov_df is not None:
+            meta = meta.merge(cov_df, on='study_id', how='left')
+        else:
+            for col in ['age_at_study', 'gender_code', 'bmi']:
+                meta[col] = np.nan
+
+        results_lmm = []
+        for pc in range(self.results['n_components']):
+            col_pc = f'PC{pc+1}'
+            data = meta.copy()
+            data[col_pc] = X_pca[:, pc]
+            data = data.dropna(subset=[col_pc, 'has_apnea', 'patient_id'])
+            if len(data) < 30:
+                self.log(f"Недостаточно данных для PC{pc+1}")
+                continue
+            # Убедимся, что has_apnea имеет оба класса
+            if data['has_apnea'].nunique() < 2:
+                self.log(f"PC{pc+1}: has_apnea только один класс, пропуск.")
+                continue
+            formula = f"{col_pc} ~ has_apnea"
+            if self.include_stage.get() and 'epoch_stage' in data.columns:
+                formula += " + epoch_stage"
+            if self.include_covariates.get() and cov_df is not None:
+                formula += " + age_at_study + gender_code + bmi"
             try:
-                model = smf.mixedlm(f"{col} ~ has_apnea", df_pcs, groups=df_pcs['patient_id'])
+                model = smf.mixedlm(formula, data, groups=data['patient_id'])
                 result = model.fit(reml=True, method='lbfgs', maxiter=1000)
                 beta = result.params.get('has_apnea[T.True]', result.params.get('has_apnea', None))
                 pval = result.pvalues.get('has_apnea[T.True]', result.pvalues.get('has_apnea', None))
-                if beta is not None and pval is not None:
-                    ci = result.conf_int().loc['has_apnea[T.True]' if 'has_apnea[T.True]' in result.params else 'has_apnea']
-                    results.append({
-                        'PC': i+1,
-                        'beta': beta,
-                        'p_value': pval,
-                        'ci_low': ci[0],
-                        'ci_high': ci[1],
-                        'n_obs': len(df_pcs)
-                    })
-                else:
-                    results.append({'PC': i+1, 'beta': np.nan, 'p_value': np.nan})
+                if beta is None or pval is None:
+                    continue
+                ci = result.conf_int().loc['has_apnea[T.True]' if 'has_apnea[T.True]' in result.params else 'has_apnea']
+                results_lmm.append({
+                    'PC': pc+1,
+                    'beta': beta,
+                    'p_value': pval,
+                    'ci_low': ci[0],
+                    'ci_high': ci[1],
+                    'n_obs': len(data)
+                })
             except Exception as e:
-                self.log(f"LMM для PC{i+1} не сошлась: {e}")
-                results.append({'PC': i+1, 'beta': np.nan, 'p_value': np.nan})
-        return pd.DataFrame(results)
-        
-    def _run_logistic_regression(self, X_pca, y, patients, pca, feature_names):
-        n_comp = X_pca.shape[1]
-        self.log(f"Логистическая регрессия на {n_comp} ПК, кросс-валидация по пациентам (фолдов: {self.logreg_cv_folds.get()})")
-        unique_patients = np.unique(patients)
-        n_folds = min(self.logreg_cv_folds.get(), len(unique_patients))
-        skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
-        lr = LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42)
-        auc_scores = []
-        for train_idx, test_idx in skf.split(X_pca, y):
-            X_train, X_test = X_pca[train_idx], X_pca[test_idx]
-            y_train, y_test = y[train_idx], y[test_idx]
-            lr.fit(X_train, y_train)
-            pred = lr.predict_proba(X_test)[:, 1]
-            auc = roc_auc_score(y_test, pred)
-            auc_scores.append(auc)
-        mean_auc = np.mean(auc_scores)
-        std_auc = np.std(auc_scores)
-        self.log(f"Логистическая регрессия: средний AUC = {mean_auc:.3f} ± {std_auc:.3f}")
-        
-        # Обучение на всех данных
-        lr.fit(X_pca, y)
-        intercept = lr.intercept_[0]
-        coefs = lr.coef_[0]
-        coef_df = pd.DataFrame({
-            'Component': [f'PC{i+1}' for i in range(n_comp)],
-            'Coefficient': coefs,
-            'Odds_ratio': np.exp(coefs)
-        })
-        # Вычисление AUC на всей выборке (для отчёта)
-        pred_full = lr.predict_proba(X_pca)[:, 1]
-        auc_full = roc_auc_score(y, pred_full)
-        return {
-            'intercept': intercept,
-            'coef_df': coef_df,
-            'mean_auc': mean_auc,
-            'std_auc': std_auc,
-            'auc_full': auc_full,
-            'model': lr,
-            'pred_full': pred_full,
-            'y': y
-        }
-        
-    # ------------------------------------------------------------
-    # Графики
-    # ------------------------------------------------------------
-    def _plot_scatter(self, X_pca, meta):
-        container = self.plot_frames['scatter']
-        for widget in container.winfo_children():
+                self.log(f"Ошибка LMM для PC{pc+1}: {e}")
+
+        if results_lmm:
+            lmm_df = pd.DataFrame(results_lmm)
+            pvals = lmm_df['p_value'].values
+            lmm_df['q_value'] = false_discovery_control(pvals, method='bh')
+            lmm_df['significant'] = lmm_df['q_value'] < self.fdr_threshold.get()
+            self.results['lmm'] = lmm_df
+            self.log("LMM для PC завершён.")
+        else:
+            self.results['lmm'] = pd.DataFrame()
+            self.log("LMM не дал результатов (возможно, нет эпох с апноэ в выбранном наборе).")
+
+    def _roc_for_significant_pcs(self, X_pca, y):
+        if 'lmm' not in self.results or self.results['lmm'].empty:
+            return
+        sign_pcs = self.results['lmm'][self.results['lmm']['significant']]['PC'].values
+        if len(sign_pcs) == 0:
+            self.log("Нет значимых PC для ROC.")
+            return
+        roc_data = []
+        for pc in sign_pcs:
+            scores = X_pca[:, pc-1]
+            auc = roc_auc_score(y, scores)
+            fpr, tpr, _ = roc_curve(y, scores)
+            roc_data.append({'PC': pc, 'auc': auc, 'fpr': fpr, 'tpr': tpr})
+            self.log(f"PC{pc}: AUC = {auc:.3f}")
+        self.results['roc'] = roc_data
+
+    def _cluster_patients(self, pc_df):
+        """
+        pc_df: DataFrame с колонками 'patient_id', 'PC1', 'PC2'
+        """
+        # Усредняем по пациенту (если у пациента несколько эпох)
+        patient_avg = pc_df.groupby('patient_id').mean().reset_index()
+        if len(patient_avg) < 3:
+            self.log("Слишком мало пациентов для кластеризации.")
+            return
+        X_clust = patient_avg[['PC1', 'PC2']].values
+        linkage_matrix = linkage(X_clust, method='ward', metric='euclidean')
+        # Оптимальное число кластеров по силуэту
+        silhouette_scores = []
+        for k in range(2, min(10, len(patient_avg) - 1)):
+            labels = fcluster(linkage_matrix, k, criterion='maxclust')
+            if len(set(labels)) > 1:
+                score = silhouette_score(X_clust, labels)
+                silhouette_scores.append((k, score))
+        best_k = max(silhouette_scores, key=lambda x: x[1])[0] if silhouette_scores else 2
+        self.log(f"Оптимальное число кластеров по силуэту: {best_k}")
+        labels = fcluster(linkage_matrix, best_k, criterion='maxclust')
+        patient_avg['cluster'] = labels
+        self.results['patient_clusters'] = patient_avg
+        self.results['linkage_matrix'] = linkage_matrix
+        self.results['best_k'] = best_k
+
+        # Бутстрап устойчивости
+        self._bootstrap_clusters(X_clust, labels)
+
+        # Сравнение с клиническими данными
+        filtered_df = self.main_app.get_filtered_data()
+        if filtered_df is not None and not filtered_df.empty:
+            clinical = filtered_df[['patient_id', 'age_at_study', 'gender', 'bmi',
+                                    'breathing_impairment_severity', 'cvd_hypertension',
+                                    'endocrine_diabetes']].drop_duplicates('patient_id')
+            merged = patient_avg.merge(clinical, on='patient_id', how='left')
+            cluster_stats = {}
+            for cl in sorted(merged['cluster'].unique()):
+                sub = merged[merged['cluster'] == cl]
+                stats = {
+                    'n': len(sub),
+                    'age_mean': sub['age_at_study'].mean(),
+                    'age_std': sub['age_at_study'].std(),
+                    'bmi_mean': sub['bmi'].mean(),
+                    'bmi_std': sub['bmi'].std(),
+                    'gender_M': (sub['gender'] == 'M').mean(),
+                    'hypertension': sub['cvd_hypertension'].mean(),
+                    'diabetes': sub['endocrine_diabetes'].mean(),
+                    'severity_counts': sub['breathing_impairment_severity'].value_counts().to_dict()
+                }
+                cluster_stats[cl] = stats
+            self.results['cluster_stats'] = cluster_stats
+
+            # Статистические тесты
+            age_groups = [merged[merged['cluster'] == cl]['age_at_study'].dropna().values for cl in
+                          sorted(merged['cluster'].unique())]
+            if len(age_groups) > 1 and all(len(g) > 1 for g in age_groups):
+                f_age, p_age = f_oneway(*age_groups)
+                self.results['anova_age'] = {'f': f_age, 'p': p_age}
+                self.log(f"ANOVA возраст: F={f_age:.3f}, p={p_age:.4f}")
+            bmi_groups = [merged[merged['cluster'] == cl]['bmi'].dropna().values for cl in
+                          sorted(merged['cluster'].unique())]
+            if len(bmi_groups) > 1 and all(len(g) > 1 for g in bmi_groups):
+                f_bmi, p_bmi = f_oneway(*bmi_groups)
+                self.results['anova_bmi'] = {'f': f_bmi, 'p': p_bmi}
+                self.log(f"ANOVA ИМТ: F={f_bmi:.3f}, p={p_bmi:.4f}")
+            severity_table = pd.crosstab(merged['cluster'], merged['breathing_impairment_severity'])
+            if severity_table.shape[0] > 1 and severity_table.shape[1] > 1:
+                chi2, p_chi2, dof, _ = chi2_contingency(severity_table)
+                self.results['chi2_severity'] = {'chi2': chi2, 'p': p_chi2}
+                self.log(f"χ² тяжесть ОАС: χ²={chi2:.3f}, p={p_chi2:.4f}")
+
+    def _bootstrap_clusters(self, X, original_labels, n_iter=500):
+        from sklearn.utils import resample
+        n_patients = X.shape[0]
+        ari_scores = []
+        for _ in range(min(n_iter, 500)):
+            if self.stop_flag:
+                break
+            boot_idx = resample(range(n_patients), replace=True, n_samples=n_patients)
+            X_boot = X[boot_idx]
+            try:
+                link_boot = linkage(X_boot, method='ward', metric='euclidean')
+                labels_boot = fcluster(link_boot, self.results['best_k'], criterion='maxclust')
+                ari = adjusted_rand_score(original_labels, labels_boot[:len(original_labels)])
+                ari_scores.append(ari)
+            except:
+                pass
+        if ari_scores:
+            mean_ari = np.mean(ari_scores)
+            self.log(f"Бутстрап устойчивость кластеров: средний ARI = {mean_ari:.3f} (500 итераций)")
+            self.results['bootstrap_ari'] = mean_ari
+
+    def _display_stats_table(self):
+        for row in self.stats_tree.get_children():
+            self.stats_tree.delete(row)
+        if 'lmm' in self.results and not self.results['lmm'].empty:
+            self.stats_tree['columns'] = list(self.results['lmm'].columns)
+            for col in self.results['lmm'].columns:
+                self.stats_tree.heading(col, text=col)
+                self.stats_tree.column(col, width=80, anchor='center')
+            for _, row in self.results['lmm'].iterrows():
+                self.stats_tree.insert('', 'end', values=list(row))
+        else:
+            self.stats_tree['columns'] = ['message']
+            self.stats_tree.heading('message', text='Информация')
+            self.stats_tree.insert('', 'end', values=['Нет результатов LMM (возможно, нет эпох с апноэ в выбранном типе для LMM)'])
+
+    def _plot_pca_results(self, pca, X_pca_tonic, X_pca_mixed, y_mixed):
+        for widget in self.pca_frame.winfo_children():
             widget.destroy()
-        fig = Figure(figsize=(8, 6), dpi=100)
-        ax = fig.add_subplot(111)
-        colors = meta['has_apnea'].map({True: 'red', False: 'blue'})
-        ax.scatter(X_pca[:, 0], X_pca[:, 1], c=colors, alpha=0.5, s=10)
-        ax.set_xlabel('PC1')
-        ax.set_ylabel('PC2')
-        ax.set_title('PCA projection (apnea vs no apnea)')
-        legend_elements = [plt.Line2D([0],[0], marker='o', color='w', markerfacecolor='red', label='Apnea'),
-                           plt.Line2D([0],[0], marker='o', color='w', markerfacecolor='blue', label='No apnea')]
-        ax.legend(handles=legend_elements)
-        canvas = FigureCanvasTkAgg(fig, master=container)
+        fig = Figure(figsize=(12, 10), dpi=100)
+        # Проекция PC1/PC2 для смешанных эпох (апноэ/неапноэ)
+        ax1 = fig.add_subplot(2, 2, 1)
+        colors = np.where(y_mixed == 1, 'red', 'blue')
+        ax1.scatter(X_pca_mixed[:, 0], X_pca_mixed[:, 1], c=colors, alpha=0.3, s=5)
+        ax1.set_xlabel('PC1')
+        ax1.set_ylabel('PC2')
+        ax1.set_title('Проекция смешанных эпох (красный – апноэ)')
+        # Scree plot
+        ax2 = fig.add_subplot(2, 2, 2)
+        var_ratio = pca.explained_variance_ratio_[:self.results['n_components']]
+        ax2.bar(range(1, len(var_ratio)+1), var_ratio)
+        ax2.set_xlabel('Главная компонента')
+        ax2.set_ylabel('Доля дисперсии')
+        ax2.set_title('Scree plot')
+        # Loadings
+        ax3 = fig.add_subplot(2, 2, 3)
+        loadings = pca.components_.T
+        sum_abs = np.sum(np.abs(loadings[:, :self.results['n_components']]), axis=1)
+        top_idx = np.argsort(sum_abs)[-20:]
+        top_features = [self.results['feature_names'][i] for i in top_idx]
+        top_loadings = loadings[top_idx, :self.results['n_components']]
+        im = ax3.imshow(top_loadings, cmap='RdBu_r', aspect='auto')
+        ax3.set_xticks(np.arange(self.results['n_components']))
+        ax3.set_xticklabels([f'PC{i+1}' for i in range(self.results['n_components'])])
+        ax3.set_yticks(np.arange(len(top_features)))
+        ax3.set_yticklabels(top_features, fontsize=8)
+        fig.colorbar(im, ax=ax3)
+        ax3.set_title('Loadings (топ-20 признаков)')
+        # ROC
+        ax4 = fig.add_subplot(2, 2, 4)
+        if 'roc' in self.results and self.results['roc']:
+            for roc in self.results['roc']:
+                ax4.plot(roc['fpr'], roc['tpr'], label=f"PC{roc['PC']} (AUC={roc['auc']:.3f})")
+            ax4.plot([0,1],[0,1], 'k--')
+            ax4.set_xlabel('False positive rate')
+            ax4.set_ylabel('True positive rate')
+            ax4.set_title('ROC кривые')
+            ax4.legend()
+        else:
+            ax4.text(0.5, 0.5, 'Нет значимых PC (или нет эпох с апноэ в LMM-выборке)', ha='center', va='center')
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=self.pca_frame)
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.current_figure = fig
-        
-    def _plot_variance(self, pca):
-        container = self.plot_frames['variance']
-        for widget in container.winfo_children():
+
+    def _plot_cluster_results(self):
+        if 'patient_clusters' not in self.results:
+            return
+        for widget in self.cluster_frame.winfo_children():
             widget.destroy()
-        fig = Figure(figsize=(8, 6), dpi=100)
-        ax = fig.add_subplot(111)
-        n_comp = len(pca.explained_variance_ratio_)
-        ax.bar(range(1, n_comp+1), pca.explained_variance_ratio_)
-        ax.set_xlabel('Principal component')
-        ax.set_ylabel('Explained variance ratio')
-        ax.set_title('Scree plot')
-        canvas = FigureCanvasTkAgg(fig, master=container)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        
-    def _plot_loadings(self, pca, feature_names, n_comp):
-        container = self.plot_frames['loadings']
-        for widget in container.winfo_children():
-            widget.destroy()
-        loadings = pca.components_.T
-        sum_abs = np.sum(np.abs(loadings[:, :n_comp]), axis=1)
-        top_idx = np.argsort(sum_abs)[-20:]
-        top_features = [feature_names[i] for i in top_idx]
-        top_loadings = loadings[top_idx, :n_comp]
         fig = Figure(figsize=(12, 8), dpi=100)
-        ax = fig.add_subplot(111)
-        im = ax.imshow(top_loadings, cmap='RdBu_r', aspect='auto')
-        ax.set_xticks(np.arange(n_comp))
-        ax.set_xticklabels([f'PC{i+1}' for i in range(n_comp)])
-        ax.set_yticks(np.arange(len(top_features)))
-        ax.set_yticklabels(top_features)
-        plt.colorbar(im, ax=ax)
-        ax.set_title('Loadings heatmap (top 20 features)')
-        canvas = FigureCanvasTkAgg(fig, master=container)
+        # Дендрограмма
+        ax1 = fig.add_subplot(2, 2, 1)
+        labels = self.results['patient_clusters']['patient_id'].astype(str).tolist()
+        dendrogram(self.results['linkage_matrix'], ax=ax1, labels=labels, leaf_rotation=90, leaf_font_size=8)
+        ax1.set_title('Дендрограмма')
+        # Кластеры в пространстве PC1/PC2
+        ax2 = fig.add_subplot(2, 2, 2)
+        clust = self.results['patient_clusters']
+        for cl in sorted(clust['cluster'].unique()):
+            sub = clust[clust['cluster'] == cl]
+            ax2.scatter(sub['PC1'], sub['PC2'], label=f'Кластер {cl}', alpha=0.7)
+        ax2.set_xlabel('PC1')
+        ax2.set_ylabel('PC2')
+        ax2.set_title('Кластеры пациентов (по средним PC1/PC2)')
+        ax2.legend()
+        # Таблица сравнения
+        ax3 = fig.add_subplot(2, 2, 3)
+        ax3.axis('tight')
+        ax3.axis('off')
+        if 'cluster_stats' in self.results:
+            rows = []
+            for cl, st in self.results['cluster_stats'].items():
+                rows.append([
+                    cl, st['n'],
+                    f"{st['age_mean']:.1f}±{st['age_std']:.1f}",
+                    f"{st['bmi_mean']:.1f}±{st['bmi_std']:.1f}",
+                    f"{st['gender_M']*100:.1f}",
+                    f"{st['hypertension']*100:.1f}",
+                    f"{st['diabetes']*100:.1f}"
+                ])
+            table = ax3.table(cellText=rows,
+                              colLabels=['Кластер','n','Возраст','ИМТ','Мужчины%','Гиперт.%','Диабет%'],
+                              loc='center', cellLoc='center')
+            table.auto_set_font_size(False)
+            table.set_fontsize(8)
+            ax3.set_title('Сравнение кластеров')
+        # Тесты
+        ax4 = fig.add_subplot(2, 2, 4)
+        ax4.axis('off')
+        text = "Статистические тесты:\n"
+        if 'anova_age' in self.results:
+            text += f"ANOVA возраст: F={self.results['anova_age']['f']:.3f}, p={self.results['anova_age']['p']:.4f}\n"
+        if 'anova_bmi' in self.results:
+            text += f"ANOVA ИМТ: F={self.results['anova_bmi']['f']:.3f}, p={self.results['anova_bmi']['p']:.4f}\n"
+        if 'chi2_severity' in self.results:
+            text += f"χ² тяжесть ОАС: χ²={self.results['chi2_severity']['chi2']:.3f}, p={self.results['chi2_severity']['p']:.4f}\n"
+        if 'bootstrap_ari' in self.results:
+            text += f"Устойчивость (ARI бутстрап): {self.results['bootstrap_ari']:.3f}\n"
+        ax4.text(0.1, 0.9, text, transform=ax4.transAxes, fontsize=10, verticalalignment='top')
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=self.cluster_frame)
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        
-    def _plot_roc_curves(self, y, X_pca, logreg_results):
-        container = self.plot_frames['roc']
-        for widget in container.winfo_children():
-            widget.destroy()
-        fig = Figure(figsize=(8, 6), dpi=100)
-        ax = fig.add_subplot(111)
-        # Лучшая отдельная PC
-        auc_single = []
-        for i in range(X_pca.shape[1]):
-            auc_single.append(roc_auc_score(y, X_pca[:, i]))
-        best_pc = np.argmax(auc_single)
-        fpr_pc, tpr_pc, _ = roc_curve(y, X_pca[:, best_pc])
-        ax.plot(fpr_pc, tpr_pc, label=f'Best PC (PC{best_pc+1}, AUC={auc_single[best_pc]:.3f})')
-        # Логистическая регрессия
-        fpr_lr, tpr_lr, _ = roc_curve(y, logreg_results['pred_full'])
-        ax.plot(fpr_lr, tpr_lr, label=f'LogReg on PCs (AUC={logreg_results["auc_full"]:.3f})')
-        ax.plot([0,1],[0,1], 'k--')
-        ax.set_xlabel('False positive rate')
-        ax.set_ylabel('True positive rate')
-        ax.set_title('ROC curves')
-        ax.legend()
-        canvas = FigureCanvasTkAgg(fig, master=container)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        
-    def _display_coef_table(self, coef_df, intercept):
-        container = self.plot_frames['coef']
-        for widget in container.winfo_children():
-            widget.destroy()
-        tree_frame = ttk.Frame(container)
-        tree_frame.pack(fill=tk.BOTH, expand=True)
-        tree = ttk.Treeview(tree_frame, columns=list(coef_df.columns), show='headings')
-        for col in coef_df.columns:
-            tree.heading(col, text=col)
-            tree.column(col, width=100, anchor='center')
-        for _, row in coef_df.iterrows():
-            tree.insert('', 'end', values=list(row))
-        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=tree.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        tree.configure(yscrollcommand=scrollbar.set)
-        info_label = ttk.Label(container, text=f"Intercept (β₀) = {intercept:.4f}", font=('Arial', 10, 'bold'))
-        info_label.pack(pady=5)
-        
-    def _clear_coef_tab(self):
-        container = self.plot_frames['coef']
-        for widget in container.winfo_children():
-            widget.destroy()
-        label = ttk.Label(container, text="Логистическая регрессия не выполнялась.\nВключите опцию и запустите PCA.")
-        label.pack(expand=True)
-        
-    # ------------------------------------------------------------
-    # Проверка нормальности PC
-    # ------------------------------------------------------------
-    def check_normality(self):
+
+    def save_results_csv(self):
         if self.results is None:
-            messagebox.showwarning("Нет данных", "Сначала выполните PCA.")
-            return
-        X_pca = self.results['X_pca']
-        n_comp = X_pca.shape[1]
-        self.diag_text.delete(1.0, tk.END)
-        for i in range(n_comp):
-            scores = X_pca[:, i]
-            if len(scores) <= 5000:
-                stat, p = shapiro(scores)
-                normal = p > 0.05
-                self.normality_results[f'PC{i+1}'] = {'p': p, 'n': len(scores), 'normal': normal}
-                self.diag_text.insert(tk.END, f"PC{i+1}: Shapiro-Wilk p={p:.4e} -> {'Нормальное' if normal else 'Ненормальное'}\n")
-            else:
-                self.normality_results[f'PC{i+1}'] = {'p': None, 'n': len(scores), 'normal': None}
-                self.diag_text.insert(tk.END, f"PC{i+1}: n={len(scores)} > 5000, тест не применялся\n")
-        # Q-Q plot для PC1 и PC2 (пример)
-        fig = Figure(figsize=(10, 5))
-        ax1 = fig.add_subplot(1,2,1)
-        stats.probplot(X_pca[:, 0], dist="norm", plot=ax1)
-        ax1.set_title('Q-Q plot PC1')
-        ax2 = fig.add_subplot(1,2,2)
-        stats.probplot(X_pca[:, 1], dist="norm", plot=ax2)
-        ax2.set_title('Q-Q plot PC2')
-        for widget in self.diag_plot_frame.winfo_children():
-            widget.destroy()
-        canvas = FigureCanvasTkAgg(fig, master=self.diag_plot_frame)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        self.notebook.select(self.tab_diag)
-        self.log("Проверка нормальности PC завершена.")
-        
-    # ------------------------------------------------------------
-    # Бутстрап нагрузок
-    # ------------------------------------------------------------
-    def run_bootstrap(self):
-        if self.results is None:
-            messagebox.showwarning("Нет данных", "Сначала выполните PCA.")
-            return
-        X = self.results['pca'].components_.T  # матрица нагрузок (n_features x n_comp)
-        feature_names = self.results['feature_names']
-        n_iter = 100
-        n_comp = X.shape[1]
-        boot_loadings = []
-        self.log(f"Бутстрап нагрузок: {n_iter} итераций...")
-        for _ in range(n_iter):
-            idx = np.random.choice(len(feature_names), size=len(feature_names), replace=True)
-            boot_loadings.append(X[idx, :])
-        boot_loadings = np.array(boot_loadings)  # (n_iter, n_features, n_comp)
-        # Вычислим CI для топ-признаков (по абсолютной сумме нагрузок)
-        sum_abs = np.sum(np.abs(X), axis=1)
-        top_idx = np.argsort(sum_abs)[-10:]
-        results = []
-        for idx in top_idx:
-            feat = feature_names[idx]
-            for pc in range(n_comp):
-                vals = boot_loadings[:, idx, pc]
-                ci_low = np.percentile(vals, 2.5)
-                ci_high = np.percentile(vals, 97.5)
-                results.append({
-                    'feature': feat,
-                    'PC': pc+1,
-                    'loading': X[idx, pc],
-                    'ci_low': ci_low,
-                    'ci_high': ci_high
-                })
-        self.bootstrap_loadings = pd.DataFrame(results)
-        self.save_bootstrap_btn.config(state=tk.NORMAL)
-        self.log("Бутстрап нагрузок завершён. Сохраните результаты через кнопку.")
-        # Покажем в диагностике
-        self.diag_text.insert(tk.END, "\n=== Бутстрап нагрузок (95% CI) ===\n")
-        self.diag_text.insert(tk.END, self.bootstrap_loadings.to_string(index=False))
-        self.notebook.select(self.tab_diag)
-        
-    def save_bootstrap_csv(self):
-        if self.bootstrap_loadings is None:
-            messagebox.showwarning("Нет данных", "Сначала выполните бутстрап.")
+            messagebox.showwarning("Нет данных", "Сначала выполните анализ.")
             return
         from tkinter import filedialog
         path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
-        if path:
-            self.bootstrap_loadings.to_csv(path, index=False)
-            self.log(f"Бутстрап нагрузок сохранён в {path}")
-            
-    # ------------------------------------------------------------
-    # Сохранение результатов
-    # ------------------------------------------------------------
-    def save_results_csv(self):
-        if self.results is None:
-            messagebox.showwarning("Нет данных", "Сначала выполните PCA.")
+        if not path:
             return
-        from tkinter import filedialog
-        file_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
-        if not file_path:
-            return
-        pca_df = self.results['meta'].copy()
-        for i in range(self.results['X_pca'].shape[1]):
-            pca_df[f'PC{i+1}'] = self.results['X_pca'][:, i]
-        pca_df.to_csv(file_path, index=False)
-        self.log(f"Координаты ПК сохранены в {file_path}")
-        if self.results.get('logreg_results'):
-            coef_path = file_path.replace('.csv', '_logreg_coef.csv')
-            coef_df = self.results['logreg_results']['coef_df'].copy()
-            coef_df.loc[-1] = ['Intercept', self.results['logreg_results']['intercept'], np.exp(self.results['logreg_results']['intercept'])]
-            coef_df.index = coef_df.index + 1
-            coef_df.sort_index(inplace=True)
-            coef_df.to_csv(coef_path, index=False)
-            self.log(f"Коэффициенты логистической регрессии сохранены в {coef_path}")
-            
+        # Здесь можно сохранить координаты PC для смешанных эпох, если нужно, но по умолчанию сохраним LMM и кластеры
+        if 'lmm' in self.results and not self.results['lmm'].empty:
+            lmm_path = path.replace('.csv', '_lmm.csv')
+            self.results['lmm'].to_csv(lmm_path, index=False)
+            self.log(f"LMM сохранён в {lmm_path}")
+        if 'patient_clusters' in self.results:
+            clust_path = path.replace('.csv', '_clusters.csv')
+            self.results['patient_clusters'].to_csv(clust_path, index=False)
+            self.log(f"Кластеры пациентов сохранены в {clust_path}")
+
     def save_plot(self):
         if self.current_figure is None:
-            messagebox.showwarning("Нет графика", "Сначала постройте график (выполните PCA).")
+            messagebox.showwarning("Нет графика", "График не построен.")
             return
         from tkinter import filedialog
-        file_path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG files", "*.png")])
-        if file_path:
-            self.current_figure.savefig(file_path, dpi=150, bbox_inches='tight')
-            self.log(f"График сохранён в {file_path}")
-            
-    # ------------------------------------------------------------
-    # Генерация HTML-отчёта
-    # ------------------------------------------------------------
+        path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG files", "*.png")])
+        if path:
+            self.current_figure.savefig(path, dpi=150, bbox_inches='tight')
+            self.log(f"График сохранён в {path}")
+
     def generate_report(self):
         if self.results is None:
-            messagebox.showwarning("Нет данных", "Сначала выполните PCA.")
+            messagebox.showwarning("Нет данных", "Сначала выполните анализ.")
             return
-        # Собираем данные
-        pca = self.results['pca']
-        var_ratio = pca.explained_variance_ratio_
-        cum_var = np.cumsum(var_ratio)
-        lmm_df = self.results['lmm_results']
-        logreg = self.results.get('logreg_results')
-        
-        # Графики
-        buf = io.BytesIO()
-        self.current_figure.savefig(buf, format='png', dpi=100, bbox_inches='tight')
-        buf.seek(0)
-        img_base64 = base64.b64encode(buf.read()).decode('utf-8')
-        plot_html = f'<div class="plot"><img src="data:image/png;base64,{img_base64}" style="max-width:100%;"/></div>'
-        
-        # Таблица LMM для PC
-        if lmm_df is not None and not lmm_df.empty:
-            lmm_html = lmm_df.to_html(index=False, float_format="%.4f")
+        # График PCA
+        buf_pca = io.BytesIO()
+        self.current_figure.savefig(buf_pca, format='png', dpi=100, bbox_inches='tight')
+        buf_pca.seek(0)
+        img_pca = base64.b64encode(buf_pca.read()).decode('utf-8')
+        # График кластеров
+        fig_clust = None
+        for widget in self.cluster_frame.winfo_children():
+            if isinstance(widget, FigureCanvasTkAgg):
+                fig_clust = widget.figure
+                break
+        img_clust = ""
+        if fig_clust:
+            buf_clust = io.BytesIO()
+            fig_clust.savefig(buf_clust, format='png', dpi=100, bbox_inches='tight')
+            buf_clust.seek(0)
+            img_clust = base64.b64encode(buf_clust.read()).decode('utf-8')
+        # LMM таблица
+        lmm_html = ""
+        eq_html = ""
+        if 'lmm' in self.results and not self.results['lmm'].empty:
+            lmm_html = self.results['lmm'].to_html(index=False, float_format="%.4f")
+            # Уравнения регрессии для значимых PC
+            sign = self.results['lmm'][self.results['lmm']['significant']]
+            if not sign.empty:
+                eq_html = "<h3>Уравнения линейной регрессии для значимых главных компонент</h3>"
+                for _, row in sign.iterrows():
+                    pc = int(row['PC'])
+                    beta = row['beta']
+                    ci_low = row['ci_low']
+                    ci_high = row['ci_high']
+                    eq_html += f"<p><strong>PC{pc}</strong> = β<sub>0</sub> + {beta:.4f}·has_apnea + ...<br>"
+                    eq_html += f"95% CI для коэффициента апноэ: [{ci_low:.4f}, {ci_high:.4f}]</p>"
         else:
-            lmm_html = "<p>LMM не выполнялись.</p>"
-            
-        # Уравнение логистической регрессии
-        logreg_html = ""
-        if logreg:
-            intercept = logreg['intercept']
-            coef_df = logreg['coef_df']
-            eq_parts = [f"logit(p) = {intercept:.4f}"]
-            for _, row in coef_df.iterrows():
-                sign = '+' if row['Coefficient'] >= 0 else '-'
-                eq_parts.append(f" {sign} {abs(row['Coefficient']):.4f} * {row['Component']}")
-            equation = "".join(eq_parts)
-            logreg_html = f"""
-            <h2>Логистическая регрессия на главных компонентах</h2>
-            <p><strong>Уравнение:</strong><br>{equation}</p>
-            <p><strong>Средний AUC (CV по пациентам):</strong> {logreg['mean_auc']:.3f} ± {logreg['std_auc']:.3f}</p>
-            <p><strong>AUC на всей выборке:</strong> {logreg['auc_full']:.3f}</p>
-            <h3>Коэффициенты и отношения шансов</h3>
-            {coef_df.to_html(index=False, float_format="%.4f")}
-            <p><em>Интерпретация:</em> Положительный коэффициент означает, что увеличение ПК повышает вероятность наличия апноэ. Отношение шансов >1 указывает на повышенный риск.</p>
-            """
-            
-        params = f"""
-        <p><strong>Тип набора эпох:</strong> {self.data_type.get()} (1=тонический,2=все,3=фильтр по положению)</p>
-        <p><strong>Число главных компонент:</strong> {self.results['n_comp']}</p>
-        <p><strong>Объяснённая дисперсия (первые 5):</strong> {var_ratio[:5].sum():.3f}</p>
-        <p><strong>Кумулятивная дисперсия:</strong> {cum_var[self.results['n_comp']-1]:.3f}</p>
-        """
-        
-        html = f"""<!DOCTYPE html>
+            lmm_html = "<p>LMM не выполнялся (нет эпох с апноэ в выбранном типе для LMM).</p>"
+
+        # Таблица кластеров
+        cluster_table = ""
+        if 'cluster_stats' in self.results:
+            rows = []
+            for cl, st in self.results['cluster_stats'].items():
+                rows.append({
+                    'Кластер': cl,
+                    'n': st['n'],
+                    'Возраст (M±SD)': f"{st['age_mean']:.1f}±{st['age_std']:.1f}",
+                    'ИМТ (M±SD)': f"{st['bmi_mean']:.1f}±{st['bmi_std']:.1f}",
+                    'Мужчины (%)': f"{st['gender_M']*100:.1f}",
+                    'Гипертензия (%)': f"{st['hypertension']*100:.1f}",
+                    'Диабет (%)': f"{st['diabetes']*100:.1f}"
+                })
+            cluster_table = pd.DataFrame(rows).to_html(index=False)
+
+        html = f"""
+        <!DOCTYPE html>
         <html>
-        <head><meta charset="utf-8"><title>PCA анализ ЭЭГ-признаков</title>
+        <head><meta charset="utf-8"><title>PCA и кластеризация ЭЭГ</title>
         <style>
             body {{ font-family: Arial; margin:20px; }}
             table {{ border-collapse: collapse; width:100%; margin-bottom:20px; }}
@@ -796,29 +753,27 @@ class PCAAnalysisTab(BaseTab):
         </style>
         </head>
         <body>
-        <h1>Отчёт о PCA анализе (Глава 2, п. 2.5.4–2.5.5)</h1>
+        <h1>Анализ главных компонент (PCA) и кластеризация пациентов</h1>
         <p><strong>Дата:</strong> {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-        {params}
-        <h2>Графики PCA</h2>
-        {plot_html}
-        <h2>Линейные смешанные модели для главных компонент (эффект апноэ)</h2>
+        <p><strong>Тип эпох для PCA:</strong> {self.pca_data_type.get()} (1=тонические, 2=все, 3=положение)</p>
+        <p><strong>Тип эпох для LMM:</strong> {self.lmm_data_type.get()}</p>
+        <p><strong>Число главных компонент:</strong> {self.results['n_components']}</p>
+        <p><strong>Объяснённая дисперсия (суммарно):</strong> {self.results['pca'].explained_variance_ratio_.sum():.3f}</p>
+        <p><strong>Количество эпох для PCA:</strong> {self.results['pca_epochs']}</p>
+        <p><strong>Количество эпох для LMM:</strong> {self.results['lmm_epochs']}</p>
+        <p><strong>FDR порог:</strong> q = {self.fdr_threshold.get()}</p>
+        <p><strong>Ковариаты в LMM:</strong> {'включены' if self.include_covariates.get() else 'не включены'}</p>
+        <div class="plot"><img src="data:image/png;base64,{img_pca}" style="max-width:100%;"/></div>
+        <h2>Результаты LMM для главных компонент</h2>
         {lmm_html}
-        {logreg_html}
-        <h2>Нормальность PC-счетов</h2>
-        <table border="1"><tr><th>Компонента</th><th>p-value (Shapiro-Wilk)</th><th>Вывод</th></tr>"""
-        for pc, res in self.normality_results.items():
-            p_str = f"{res['p']:.4e}" if res['p'] is not None else ">5000"
-            norm_str = "Нормальное" if res['normal'] else "Ненормальное" if res['normal'] is not None else "Не тестировалось"
-            html += f"<tr><td>{pc}</td><td>{p_str}</td><td>{norm_str}</td></tr>"
-        html += "</table>"
-        if self.bootstrap_loadings is not None:
-            html += f"""
-            <h2>Бутстрап нагрузок (95% доверительные интервалы)</h2>
-            {self.bootstrap_loadings.to_html(index=False, float_format="%.4f")}
-            """
-        html += """
-        <p><em>Примечание:</em> Для интерпретации загрузок используются признаки с абсолютной нагрузкой >0,4. PC1 обычно отражает общую спектральную мощность, PC2 – ось медленноволновая/быстроволновая активность.</p>
-        </body></html>
+        {eq_html}
+        <h2>Кластеризация пациентов</h2>
+        <div class="plot"><img src="data:image/png;base64,{img_clust}" style="max-width:100%;"/></div>
+        <h3>Сравнение кластеров по клиническим данным</h3>
+        {cluster_table}
+        <p><em>Интерпретация:</em> Кластеры, значимо различающиеся по тяжести ОАС, возрасту, ИМТ или коморбидностям, могут отражать разные нейрофизиологические фенотипы.</p>
+        </body>
+        </html>
         """
         fd, path = tempfile.mkstemp(suffix='.html', prefix='pca_report_')
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
