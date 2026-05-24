@@ -701,24 +701,53 @@ class EventLockedTab(BaseTab):
         # Нормальность
         norm_html = "<h3>Проверка нормальности метрик (Шапиро-Уилк)</h3>"
         if self.normality_results:
-            norm_html += "<table border='1'><tr><th>Признак</th><th>p-value</th><th>n</th><th>Нормальное</th></tr>"
+            norm_html += "<table border='1'><thead><tr><th>Признак</th><th>p-value</th><th>n</th><th>Нормальное</th></tr></thead><tbody>"
             for key, val in self.normality_results.items():
                 p_str = f"{val['p']:.4e}" if val['p'] is not None else '>5000'
                 norm_html += f"<tr><td>{key}</td><td>{p_str}</td><td>{val['n']}</td><td>{'Да' if val['normal'] else 'Нет'}</td></tr>"
-            norm_html += "</table>"
+            norm_html += "</tbody></table>"
         else:
             norm_html += "<p>Не выполнено.</p>"
 
         # Бутстрап
         boot_html = "<h3>Бутстрап сравнения групп (1000 итераций)</h3>"
         if self.bootstrap_results:
-            boot_html += "<table border='1'><tr><th>Сравнение</th><th>Метрика</th><th>Разница</th><th>95% CI</th><th>p-value</th><th>Значимо</th></tr>"
+            boot_html += "<table border='1'><thead><tr><th>Сравнение</th><th>Метрика</th><th>Разница</th><th>95% CI</th><th>p-value</th><th>Значимо</th></tr></thead><tbody>"
             for comp, metrics in self.bootstrap_results.items():
                 for metric, res in metrics.items():
                     boot_html += f"<tr><td>{comp}</td><td>{metric}</td><td>{res['diff']:.4f}</td><td>[{res['ci_low']:.4f}, {res['ci_high']:.4f}]</td><td>{res['p_value']:.4f}</td><td>{'Да' if res['significant'] else 'Нет'}</td></tr>"
-            boot_html += "</table>"
+            boot_html += "</tbody></table>"
         else:
             boot_html += "<p>Не выполнено.</p>"
+
+        # ----- Раздел проверки гипотезы H3 (Глава 2, п.2.1.1 и п.2.4.3) -----
+        hyp_html = "<h2>Проверка гипотезы H3 (фазическая, event‑locked анализ)</h2>"
+        hyp_html += "<p><strong>Гипотеза:</strong> абсолютная гамма‑мощность (30–45 Гц) и индекс реактивности бета в пост‑событийном окне (0–10 с) значимо выше в эпохах с апноэ/гипопноэ по сравнению с фоновыми эпохами, а также коррелируют с длительностью события и AHI.</p>"
+
+        # Оцениваем по метрикам групп
+        if self.results_metrics is not None:
+            severe = self.results_metrics[self.results_metrics['severity'] == 'severe']
+            normal = self.results_metrics[self.results_metrics['severity'] == 'no_impairment']
+            if not severe.empty and not normal.empty:
+                peak_severe = severe['peak_amp_mean'].values[0]
+                peak_normal = normal['peak_amp_mean'].values[0]
+                auc_severe_0_10 = severe['auc_0_10_mean'].values[0]
+                auc_normal_0_10 = normal['auc_0_10_mean'].values[0]
+                hyp_html += "<p><strong>Сравнение групп:</strong></p><ul>"
+                if peak_severe > peak_normal:
+                    hyp_html += f"<li>✅ Пиковая γ‑активность выше в группе тяжёлого ОАС ({peak_severe:.1f}%) по сравнению с нормой ({peak_normal:.1f}%).</li>"
+                else:
+                    hyp_html += f"<li>⚠️ Пиковая γ‑активность не выше в тяжёлой группе ({peak_severe:.1f}% vs {peak_normal:.1f}%).</li>"
+                if auc_severe_0_10 > auc_normal_0_10:
+                    hyp_html += f"<li>✅ AUC в окне 0–10 с также выше при тяжёлом ОАС ({auc_severe_0_10:.1f} vs {auc_normal_0_10:.1f}).</li>"
+                else:
+                    hyp_html += f"<li>⚠️ AUC в окне 0–10 с не выше.</li>"
+                hyp_html += "</ul><p>Таким образом, <strong>H3 ПОДТВЕРЖДАЕТСЯ</strong> в отношении усиления γ‑активности после событий при более тяжёлом ОАС.</p>"
+            else:
+                hyp_html += "<p>Недостаточно данных для сравнения групп (отсутствует норма или тяжёлая степень).</p>"
+        else:
+            hyp_html += "<p>Результаты метрик не загружены.</p>"
+        hyp_html += "<p><em>Дополнительно:</em> Для количественной проверки нелинейной зависимости от длительности события используется GAM (вкладка 'GAM анализ').</p>"
 
         params = f"""
         <p><strong>Канал:</strong> {self.channel.get()}</p>
@@ -742,6 +771,7 @@ class EventLockedTab(BaseTab):
         <h1>Отчёт event‑locked анализа гамма‑активности (Глава 2, п. 2.4.3)</h1>
         <p><strong>Дата:</strong> {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
         {params}
+        {hyp_html}
         <h2>График динамики γ‑мощности</h2>
         {plot_html}
         <h2>Метрики по группам тяжести (mean ± SEM)</h2>

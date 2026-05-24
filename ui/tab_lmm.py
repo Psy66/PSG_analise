@@ -1334,75 +1334,7 @@ class LMMAnalysisTab(BaseTab):
             plot_html = f'<div class="plot"><img src="data:image/png;base64,{img_base64}" style="max-width:100%;"/></div>'
 
         # ----- Раздел проверки гипотез (адаптирован под режим) -----
-        hypotheses_html = "<h2>Проверка гипотез исследования</h2>"
-        if not is_ahi_mode:
-            # Режим сравнения эпох (острый эффект)
-            delta_sign = sign[sign['feature'].isin(['abs_delta', 'rel_delta'])]
-            if not delta_sign.empty:
-                h1_status = "✅ ПОДТВЕРЖДЕНА (острая реакция)"
-                h1_detail = f"Дельта-мощность значимо различается между эпохами с апноэ и без в {delta_sign['channel'].nunique()} каналах."
-            else:
-                h1_status = "❌ НЕ ПОДТВЕРЖДЕНА"
-                h1_detail = "Нет значимых различий дельта-мощности."
-            hypotheses_html += f"<h3>H1 (тоническая спектральная) – острая реакция</h3><p><strong>{h1_status}</strong> — {h1_detail}</p>"
-
-            tbr_sign = sign[sign['feature'] == 'tbr']
-            if not tbr_sign.empty:
-                h2_status = "✅ ПОДТВЕРЖДЕНА"
-                h2_detail = f"TBR значимо {'снижается' if all(tbr_sign[beta_col] < 0) else 'изменяется'} в {tbr_sign['channel'].nunique()} каналах."
-            else:
-                h2_status = "❌ НЕ ПОДТВЕРЖДЕНА"
-                h2_detail = "TBR не показал значимых различий."
-            hypotheses_html += f"<h3>H2 (тоническая спектральная)</h3><p><strong>{h2_status}</strong> — {h2_detail}</p>"
-            hypotheses_html += "<h3>H3 (фазическая)</h3><p>❌ НЕ ПРОВЕРЯЕТСЯ В ДАННОМ АНАЛИЗЕ (требуется фазический анализ событий)</p>"
-
-            sampen_sign = sign[sign['feature'] == 'sampen']
-            if not sampen_sign.empty:
-                h4_status = "✅ ПОДТВЕРЖДЕНА"
-                h4_detail = f"Sample Entropy значимо изменяется в {sampen_sign['channel'].nunique()} каналах."
-            else:
-                h4_status = "❌ НЕ ПОДТВЕРЖДЕНА"
-                h4_detail = "Нет значимых различий SampEn."
-            hypotheses_html += f"<h3>H4 (нелинейная)</h3><p><strong>{h4_status}</strong> — {h4_detail}</p>"
-        else:
-            # Режим тонические vs AHI (хронический эффект)
-            delta_sign = sign[sign['feature'].isin(['abs_delta', 'rel_delta'])]
-            if not delta_sign.empty:
-                pos_delta = delta_sign[delta_sign[beta_col] > 0]
-                h1_status = "✅ ПОДТВЕРЖДЕНА"
-                if len(pos_delta) > 0:
-                    h1_detail = f"Дельта-мощность положительно связана с AHI в {len(pos_delta)} комбинациях (каналы: {', '.join(pos_delta['channel'].unique())}) — подтверждает H1."
-                else:
-                    h1_detail = "Дельта-мощность связана с AHI, но коэффициент отрицательный (уменьшается с ростом AHI) – противоречит H1."
-            else:
-                h1_status = "❌ НЕ ПОДТВЕРЖДЕНА"
-                h1_detail = "Нет значимой связи дельта-мощности с AHI в тонических эпохах."
-            hypotheses_html += f"<h3>H1 (хронический эффект)</h3><p><strong>{h1_status}</strong> — {h1_detail}</p>"
-            hypotheses_html += "<p><em>Гипотеза H1:</em> относительная мощность дельта-ритма в тонических эпохах N2/N3 положительно коррелирует с тяжестью ОАС.</p>"
-
-            tbr_sign = sign[sign['feature'] == 'tbr']
-            if not tbr_sign.empty:
-                neg_tbr = tbr_sign[tbr_sign[beta_col] < 0]
-                if len(neg_tbr) > 0:
-                    h2_status = "✅ ПОДТВЕРЖДЕНА"
-                    h2_detail = f"TBR отрицательно связан с AHI в {len(neg_tbr)} каналах (снижается с тяжестью)."
-                else:
-                    h2_status = "⚠️ ЧАСТИЧНО"
-                    h2_detail = "TBR связан с AHI, но положительно (противоречит H2)."
-            else:
-                h2_status = "❌ НЕ ПОДТВЕРЖДЕНА"
-                h2_detail = "Нет значимой связи TBR с AHI."
-            hypotheses_html += f"<h3>H2 (хронический эффект)</h3><p><strong>{h2_status}</strong> — {h2_detail}</p>"
-
-            sampen_sign = sign[sign['feature'] == 'sampen']
-            if not sampen_sign.empty:
-                h4_status = "✅ ПОДТВЕРЖДЕНА (хронический эффект)"
-                h4_detail = f"SampEn значимо связан с AHI в {sampen_sign['channel'].nunique()} каналах."
-            else:
-                h4_status = "❌ НЕ ПОДТВЕРЖДЕНА"
-                h4_detail = "Нет значимой связи SampEn с AHI."
-            hypotheses_html += f"<h3>H4 (нелинейная, хроническая)</h3><p><strong>{h4_status}</strong> — {h4_detail}</p>"
-            hypotheses_html += "<p><em>Примечание:</em> Для проверки H3 (фазическая) требуется отдельный анализ событий (не входит в данный LMM).</p>"
+        hypotheses_html = self._hypotheses_html(self.results_df, is_ahi_mode)
 
         # ----- Диагностика остатков -----
         diag_html = ""
@@ -1512,6 +1444,57 @@ class LMMAnalysisTab(BaseTab):
             f.write(html)
         webbrowser.open(f'file://{path}')
         self.log(f"Отчёт открыт в браузере: {path}")
+
+    def _hypotheses_html(self, results_df, is_ahi_mode):
+            sign = results_df[results_df['significant']]
+            beta_col = 'beta_ahi' if is_ahi_mode else 'beta'
+            mode_str = "хронический эффект (AHI)" if is_ahi_mode else "острый эффект (апноэ)"
+
+            html = "<h2>Проверка гипотез исследования (Глава 2, п. 2.1.1)</h2>"
+
+            # H1: дельта-мощность
+            delta_feats = ['abs_delta', 'rel_delta']
+            delta_sign = sign[sign['feature'].isin(delta_feats)]
+            if not delta_sign.empty:
+                pos = delta_sign[delta_sign[beta_col] > 0]
+                html += f"<h3>H1 (тоническая спектральная) – {mode_str}</h3>"
+                if is_ahi_mode:
+                    html += f"<p>✅ <strong>Подтверждена</strong> – дельта-мощность положительно связана с AHI в {len(pos)} комбинациях (каналы: {', '.join(pos['channel'].unique()) if not pos.empty else 'нет'}).</p>"
+                else:
+                    html += f"<p>✅ <strong>Подтверждена</strong> – дельта-мощность значимо различается между эпохами с апноэ и без в {delta_sign['channel'].nunique()} каналах.</p>"
+            else:
+                html += f"<h3>H1 (тоническая спектральная) – {mode_str}</h3><p>❌ Не подтверждена – нет значимых изменений дельта-мощности.</p>"
+
+            # H2: TBR (theta/beta ratio)
+            tbr_sign = sign[sign['feature'] == 'tbr']
+            if not tbr_sign.empty:
+                neg = tbr_sign[tbr_sign[beta_col] < 0]
+                if is_ahi_mode:
+                    html += "<h3>H2 (тоническая спектральная) – хронический эффект</h3>"
+                    if len(neg) > 0:
+                        html += f"<p>✅ <strong>Подтверждена</strong> – TBR снижается с ростом AHI в {len(neg)} каналах.</p>"
+                    else:
+                        html += f"<p>⚠️ Частично – TBR связан с AHI, но положительно (противоречит ожидаемому снижению).</p>"
+                else:
+                    html += "<h3>H2 (тоническая спектральная) – острый эффект</h3>"
+                    html += f"<p>✅ <strong>Подтверждена</strong> – TBR значимо изменяется при апноэ в {tbr_sign['channel'].nunique()} каналах (направление: {'снижение' if tbr_sign[beta_col].mean() < 0 else 'повышение'}).</p>"
+            else:
+                html += f"<h3>H2 (тоническая спектральная) – {mode_str}</h3><p>❌ Не подтверждена – TBR не показал значимых различий.</p>"
+
+            # H4: SampEn
+            sampen_sign = sign[sign['feature'] == 'sampen']
+            if not sampen_sign.empty:
+                html += f"<h3>H4 (нелинейная) – {mode_str}</h3>"
+                html += f"<p>✅ <strong>Подтверждена</strong> – Sample Entropy значимо изменяется в {sampen_sign['channel'].nunique()} каналах (направление: {'снижение' if sampen_sign[beta_col].mean() < 0 else 'повышение'}).</p>"
+            else:
+                html += f"<h3>H4 (нелинейная) – {mode_str}</h3><p>❌ Не подтверждена – нет значимых изменений SampEn.</p>"
+
+            # Для режима тонических vs AHI добавим пояснение
+            if is_ahi_mode:
+                html += "<p><em>Примечание:</em> Для проверки H3 (фазическая) требуется анализ event‑locked γ‑активности (вкладка 'Event‑locked анализ').</p>"
+            else:
+                html += "<p><em>Примечание:</em> H3 (фазическая) не проверяется в данном LMM – см. вкладки 'Event‑locked анализ' и 'GAM анализ'.</p>"
+            return html
 
     def _generate_hypotheses_html(self, sign):
         # оригинальная проверка гипотез из старого кода

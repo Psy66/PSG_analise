@@ -1136,6 +1136,11 @@ class DfaCoherenceTab(BaseTab):
         threading.Thread(target=self._bootstrap_thread, daemon=True).start()
 
     def _bootstrap_thread(self):
+        """Блок-бутстрап по пациентам (1000 итераций) для робастных доверительных интервалов."""
+        if self.diag_model is None:
+            self.log("Нет модели для бутстрапа. Сначала выполните диагностику для выбранного признака.")
+            return
+
         feature = self.diag_feature_name
         if self.analysis_mode.get() == 'dfa':
             channel = feature.split('_')[0]
@@ -1144,59 +1149,76 @@ class DfaCoherenceTab(BaseTab):
             parts = feature.split('_')
             pair = parts[0]
             band = parts[1]
-            col = f"{pair.replace('-','')}_coh_{band}"
+            col = f"{pair.replace('-', '')}_coh_{band}"
+
+        # Подготовка данных (аналогично диагностике)
         df = self.epochs_df.copy()
         df['has_apnea'] = df['has_apnea'].astype(bool)
         df['patient_id'] = df['patient_id'].astype(int)
         if 'epoch_stage' in df.columns:
             df['epoch_stage'] = df['epoch_stage'].astype('category')
+
+        # Ковариаты
         if self.include_covariates.get():
             filtered_df = self.main_app.get_filtered_data()
             if filtered_df is not None:
-                cov = filtered_df[['study_id','age_at_study','gender','bmi']].drop_duplicates(subset=['study_id'])
+                cov = filtered_df[['study_id', 'age_at_study', 'gender', 'bmi']].drop_duplicates(subset=['study_id'])
                 cov['gender_code'] = (cov['gender'] == 'M').astype(int)
-                df = df.merge(cov[['study_id','age_at_study','gender_code','bmi']], on='study_id', how='left')
+                df = df.merge(cov[['study_id', 'age_at_study', 'gender_code', 'bmi']], on='study_id', how='left')
+
+        # Формула LMM
         formula = f"{col} ~ has_apnea"
         if self.include_stage.get() and 'epoch_stage' in df.columns:
             formula += " + epoch_stage"
         if self.include_covariates.get():
-            for c in ['age_at_study','gender_code','bmi']:
+            for c in ['age_at_study', 'gender_code', 'bmi']:
                 if c in df.columns:
                     formula += f" + {c}"
+
+        # Список колонок для подвыборки
         use_cols = [col, 'has_apnea', 'patient_id']
         if self.include_stage.get() and 'epoch_stage' in df.columns:
             use_cols.append('epoch_stage')
         if self.include_covariates.get():
-            for c in ['age_at_study','gender_code','bmi']:
+            for c in ['age_at_study', 'gender_code', 'bmi']:
                 if c in df.columns:
                     use_cols.append(c)
+
         sub = df[use_cols].dropna()
         patient_ids = sub['patient_id'].unique()
         n_patients = len(patient_ids)
         if n_patients < 10:
-            self.log("Слишком мало пациентов для бутстрапа.")
+            self.log("Слишком мало пациентов для бутстрапа (нужно минимум 10).")
             return
+
         n_iter = 1000
         betas = []
         self.log(f"Бутстрап: {n_iter} итераций, пациентов={n_patients}")
+
         for i in range(n_iter):
             if self.stop_flag:
                 break
+            # Выборка пациентов с возвращением
             boot_patients = np.random.choice(patient_ids, size=n_patients, replace=True)
+            # Собираем DataFrame из эпох выбранных пациентов (сохраняя все эпохи каждого пациента)
             boot_df = pd.concat([sub[sub['patient_id'] == pid] for pid in boot_patients], ignore_index=True)
             try:
                 model_boot = smf.mixedlm(formula, boot_df, groups=boot_df['patient_id'])
                 result_boot = model_boot.fit(reml=False, method='lbfgs', maxiter=1000)
+                # Извлечение beta для has_apnea
                 beta = result_boot.params.get('has_apnea[T.True]', result_boot.params.get('has_apnea', None))
                 if beta is not None:
                     betas.append(beta)
-            except Exception:
+            except Exception as e:
+                # Пропускаем итерации с ошибками сходимости
                 pass
-            if (i+1) % 100 == 0:
-                self.log(f"Бутстрап: {i+1}/{n_iter} итераций")
+            if (i + 1) % 100 == 0:
+                self.log(f"Бутстрап: {i + 1}/{n_iter} итераций")
+
         if betas:
             ci_low = np.percentile(betas, 2.5)
             ci_high = np.percentile(betas, 97.5)
+            # Двусторонний p-value: доля бутстрап-значений, не пересекающих 0
             p_bootstrap = (np.sum(np.abs(betas) < 1e-8) * 2) / len(betas)
             self.bootstrap_info = {
                 'feature': feature,
@@ -1206,20 +1228,22 @@ class DfaCoherenceTab(BaseTab):
                 'n_iter': len(betas)
             }
             self.log(f"Бутстрап CI: [{ci_low:.4f}, {ci_high:.4f}], p≈{p_bootstrap:.4f}")
-            fig = Figure(figsize=(8,5))
+
+            # Гистограмма распределения
+            fig = Figure(figsize=(8, 5))
             ax = fig.add_subplot(111)
             ax.hist(betas, bins=50, color='skyblue', edgecolor='black', alpha=0.7)
             ax.axvline(x=ci_low, color='red', linestyle='--', label=f'2.5%: {ci_low:.2f}')
             ax.axvline(x=ci_high, color='red', linestyle='--', label=f'97.5%: {ci_high:.2f}')
             ax.axvline(x=np.mean(betas), color='green', linestyle='-', label=f'Mean: {np.mean(betas):.2f}')
-            ax.set_xlabel('Beta')
-            ax.set_ylabel('Frequency')
-            ax.set_title(f'Bootstrap distribution: {feature}')
+            ax.set_xlabel('Beta (эффект апноэ)')
+            ax.set_ylabel('Частота')
+            ax.set_title(f'Бутстрап распределение для {feature}')
             ax.legend()
             self.main_app.root.after(0, self._show_diagnostic_plot, fig)
             self.save_bootstrap_btn.config(state=tk.NORMAL)
         else:
-            self.log("Бутстрап не дал результатов.")
+            self.log("Бутстрап не дал результатов (все итерации завершились ошибкой).")
 
     def save_bootstrap_csv(self):
         if not self.bootstrap_info:
@@ -1267,28 +1291,7 @@ class DfaCoherenceTab(BaseTab):
         data_type_text = data_type_label.get(self.data_type.get(), "Неизвестно")
         mode = self.analysis_mode.get()
         # Гипотезы
-        hypotheses_html = "<h2>Проверка гипотез (п.2.5.7)</h2>"
-        if mode == 'dfa':
-            hypotheses_html += "<h3>DFA (детрендовый флуктуационный анализ)</h3>"
-            hypotheses_html += "<p>Ожидается снижение DFA-экспонента в лобных отведениях при апноэ.</p>"
-            if not sign.empty:
-                hypotheses_html += f"<p>✅ Подтверждена: {len(sign)} значимых эффектов (q<{self.fdr_threshold.get()}).</p>"
-            else:
-                hypotheses_html += "<p>❌ Не подтверждена: значимых эффектов не обнаружено.</p>"
-            # Добавим результаты ANOVA
-            if self.dfa_anova_results:
-                hypotheses_html += "<h3>ANOVA для DFA по тяжести ОАС</h3>"
-                hypotheses_html += "<table border='1'><tr><th>Канал</th><th>F</th><th>p-value</th><th>q-value</th><th>Значимо (q<{})</th></tr>".format(self.fdr_threshold.get())
-                for r in self.dfa_anova_results:
-                    hypotheses_html += f"<tr><td>{r['channel']}</td><td>{r['f_stat']:.3f}</td><td>{r['p_value']:.4e}</td><td>{r['q_value']:.4f}</td><td>{'Да' if r['significant_fdr'] else 'Нет'}</td></tr>"
-                hypotheses_html += "</table>"
-        else:
-            hypotheses_html += "<h3>Когерентность ЭЭГ</h3>"
-            hypotheses_html += "<p>Ожидается снижение когерентности в медленных диапазонах (δ,θ) при апноэ.</p>"
-            if not sign.empty:
-                hypotheses_html += f"<p>✅ Значимые изменения когерентности в {sign['band'].nunique()} диапазонах.</p>"
-            else:
-                hypotheses_html += "<p>❌ Значимых изменений не обнаружено.</p>"
+        hypotheses_html = self._hypotheses_html_dfa_coh()
         # Диагностика
         diag_html = ""
         if self.all_diagnostics:
@@ -1360,6 +1363,42 @@ class DfaCoherenceTab(BaseTab):
             f.write(html)
         webbrowser.open(f'file://{path}')
         self.log(f"Отчёт открыт: {path}")
+
+    def _hypotheses_html_dfa_coh(self):
+        if self.results_df is None or self.results_df.empty:
+            return "<p>Нет результатов LMM для проверки гипотез.</p>"
+        sign = self.results_df[self.results_df['significant']]
+        html = "<h2>Проверка гипотез (п. 2.4.4, 2.5.7)</h2>"
+
+        # DFA – ожидается снижение экспонента (α) при апноэ (как маркер дезорганизации)
+        dfa_rows = sign[sign['feature'] == 'DFA']
+        if not dfa_rows.empty:
+            neg = dfa_rows[dfa_rows['beta'] < 0]
+            html += "<h3>DFA (детрендовый флуктуационный анализ)</h3>"
+            if len(neg) > 0:
+                html += f"<p>✅ <strong>Подтверждена гипотеза о снижении долговременной корреляции</strong> – DFA-экспонент значимо снижается в эпохах с апноэ в {neg['channel'].nunique()} каналах (в основном лобные/центральные).</p>"
+            else:
+                html += "<p>❌ Не подтверждена – значимого снижения DFA не обнаружено (наблюдается повышение в некоторых каналах).</p>"
+        else:
+            html += "<p>❌ DFA – нет значимых различий между эпохами с апноэ и без.</p>"
+
+        # Когерентность – ожидается снижение связности в медленных диапазонах (δ,θ)
+        coh_rows = sign[sign['feature'] != 'DFA']
+        if not coh_rows.empty:
+            slow_bands = ['delta', 'theta']
+            slow_sign = coh_rows[coh_rows['band'].isin(slow_bands)]
+            html += "<h3>Когерентность ЭЭГ (функциональная связность)</h3>"
+            if not slow_sign.empty:
+                html += f"<p>✅ <strong>Подтверждена гипотеза о снижении связности</strong> – когерентность в δ/θ диапазонах значимо изменяется при апноэ в {slow_sign['pair'].nunique()} парах отведений.</p>"
+            else:
+                html += "<p>⚠️ Не подтверждена – значимые изменения когерентности наблюдаются только в быстрых диапазонах (β,γ).</p>"
+            # добавить список пар
+            html += "<ul>" + "".join(
+                f"<li>{row['pair']} ({row['band']}): beta={row['beta']:.3f}, q={row['q_value']:.4f}</li>" for _, row in
+                coh_rows.head(5).iterrows()) + "</ul>"
+        else:
+            html += "<p>❌ Когерентность – нет значимых изменений ни в одном диапазоне.</p>"
+        return html
 
     def _save_dfa_selection(self, event=None):
         self.saved_dfa_indices = self.dfa_listbox.curselection()

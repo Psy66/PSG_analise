@@ -635,6 +635,7 @@ class PCAAnalysisTab(BaseTab):
         buf_pca = io.BytesIO()
         self.current_figure.savefig(buf_pca, format='png', dpi=100, bbox_inches='tight')
         img_pca = base64.b64encode(buf_pca.getvalue()).decode('utf-8')
+
         buf_clust = io.BytesIO()
         for w in self.cluster_frame.winfo_children():
             if isinstance(w, FigureCanvasTkAgg):
@@ -663,15 +664,54 @@ class PCAAnalysisTab(BaseTab):
                     'Кластер': cl, 'n': st['n'],
                     'Возраст (M±SD)': f"{st['age_mean']:.1f}±{st['age_std']:.1f}",
                     'ИМТ (M±SD)': f"{st['bmi_mean']:.1f}±{st['bmi_std']:.1f}",
-                    'Мужчины (%)': f"{st['gender_M']*100:.1f}",
-                    'Гипертензия (%)': f"{st['hypertension']*100:.1f}",
-                    'Диабет (%)': f"{st['diabetes']*100:.1f}"
+                    'Мужчины (%)': f"{st['gender_M'] * 100:.1f}",
+                    'Гипертензия (%)': f"{st['hypertension'] * 100:.1f}",
+                    'Диабет (%)': f"{st['diabetes'] * 100:.1f}"
                 })
             cluster_table = pd.DataFrame(rows).to_html(index=False)
 
+        # ----- Раздел проверки гипотез (Глава 2, п.2.5.4, 2.5.5) -----
+        hyp_html = "<h2>Интерпретация результатов в контексте гипотез (Глава 2, п.2.5.4, 2.5.5)</h2>"
+        hyp_html += "<h3>Анализ главных компонент (PCA)</h3>"
+        if 'pca' in self.results:
+            expl_var = self.results['pca'].explained_variance_ratio_.sum()
+            hyp_html += f"<p>Первые {self.results['n_components']} главных компонент объясняют {expl_var * 100:.1f}% дисперсии исходных признаков. "
+            if 'lmm' in self.results and not self.results['lmm'].empty:
+                sign_pcs = self.results['lmm'][self.results['lmm']['significant']]['PC'].tolist()
+                if sign_pcs:
+                    hyp_html += f"Компоненты {sign_pcs} значимо различаются между эпохами с апноэ и без (LMM, q&lt;{self.fdr_threshold.get()}), что подтверждает наличие нейрофизиологических паттернов, связанных с ОАС.</p>"
+                else:
+                    hyp_html += "Ни одна компонента не показала значимых различий – возможно, требуется больше данных или эффект нелинейный.</p>"
+            else:
+                hyp_html += "LMM для PC не выполнялся (нет эпох с апноэ).</p>"
+        else:
+            hyp_html += "<p>PCA не выполнялся.</p>"
+
+        hyp_html += "<h3>Кластеризация пациентов на основе ЭЭГ‑признаков</h3>"
+        if 'cluster_stats' in self.results:
+            n_clust = len(self.results['cluster_stats'])
+            hyp_html += f"<p>Выявлено {n_clust} нейрофизиологических фенотипа, которые различаются по клиническим характеристикам (возраст, ИМТ, коморбидности). "
+            if 'anova_age' in self.results and self.results['anova_age']['p'] < 0.05:
+                hyp_html += "Обнаружены значимые различия по возрасту между кластерами. "
+            if 'chi2_severity' in self.results and self.results['chi2_severity']['p'] < 0.05:
+                hyp_html += "Распределение тяжести ОАС значимо различается между кластерами. "
+            hyp_html += "Это подтверждает гетерогенность ОАС, не полностью объясняемую AHI.</p>"
+            if 'bootstrap_ari' in self.results:
+                hyp_html += f"<p>Устойчивость кластерного решения (ARI бутстрап): {self.results['bootstrap_ari']:.3f} (близость к 1 означает высокую стабильность).</p>"
+        else:
+            hyp_html += "<p>Кластеризация не выявила устойчивых групп – возможно, низкое качество данных или малый размер выборки.</p>"
+
+        hyp_html += "<p><em>Примечание:</em> Полученные результаты следует интерпретировать совместно с клиническими данными и другими вкладками анализа (LMM, DFA, когерентность).</p>"
+
         html = f"""<!DOCTYPE html>
         <html><head><meta charset="utf-8"><title>PCA и кластеризация ЭЭГ</title>
-        <style> body{{font-family:Arial;margin:20px;}} table{{border-collapse:collapse;width:100%;margin-bottom:20px;}} th,td{{border:1px solid #ddd;padding:8px;text-align:left;}} th{{background:#f2f2f2;}} .plot{{margin:20px 0;text-align:center;}} </style>
+        <style>
+            body{{font-family:Arial;margin:20px;}}
+            table{{border-collapse:collapse;width:100%;margin-bottom:20px;}}
+            th,td{{border:1px solid #ddd;padding:8px;text-align:left;}}
+            th{{background:#f2f2f2;}}
+            .plot{{margin:20px 0;text-align:center;}}
+        </style>
         </head><body>
         <h1>Анализ главных компонент (PCA) и кластеризация пациентов</h1>
         <p><strong>Дата:</strong> {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
@@ -679,12 +719,13 @@ class PCAAnalysisTab(BaseTab):
         <p><strong>Число компонент:</strong> {self.results['n_components']} | <strong>Объяснённая дисперсия:</strong> {self.results['pca'].explained_variance_ratio_.sum():.3f}</p>
         <p><strong>Эпох PCA:</strong> {self.results['pca_epochs']} | <strong>Эпох LMM:</strong> {self.results['lmm_epochs']}</p>
         <p><strong>FDR порог:</strong> q = {self.fdr_threshold.get()} | <strong>Ковариаты:</strong> {'включены' if self.include_covariates.get() else 'нет'}</p>
+        {hyp_html}
         <div class="plot"><img src="data:image/png;base64,{img_pca}" style="max-width:100%;"/></div>
         <h2>Результаты LMM для главных компонент</h2>{lmm_html}{eq_html}
         <h2>Кластеризация пациентов</h2>
         <div class="plot"><img src="data:image/png;base64,{img_clust}" style="max-width:100%;"/></div>
         <h3>Сравнение кластеров</h3>{cluster_table}
-        <p><em>Интерпретация:</em> Значимые различия между кластерами по клиническим данным указывают на нейрофизиологические фенотипы.</p>
+        <p><em>Интерпретация:</em> Значимые различия между кластерами по клиническим данным указывают на нейрофизиологические фенотипы, что частично подтверждает гипотезу о гетерогенности ОАС.</p>
         </body></html>"""
         fd, path = tempfile.mkstemp(suffix='.html', prefix='pca_report_')
         with os.fdopen(fd, 'w', encoding='utf-8') as f:

@@ -1,6 +1,6 @@
 # ui/tab_gam.py
 """
-Генерализованные аддитивные модели (GAM) для анализа нелинейных зависимолен
+Генерализованные аддитивные модели (GAM) для анализа нелинейных зависимостей
 нормализованной гамма‑мощности от длительности апноэ и времени относительно offset.
 Соответствует Главе 2, п. 2.5.6.
 """
@@ -26,10 +26,10 @@ from core.api_client import get_event_time_series
 # Проверка наличия rpy2 и R
 try:
     import rpy2.robjects as ro
-    from rpy2.robjects import pandas2ri
-    from rpy2.robjects.conversion import localconverter
+    from rpy2.robjects import pandas2ri, numpy2ri
     from rpy2.robjects.packages import importr
     from rpy2.robjects import Formula
+    from rpy2.robjects import conversion, default_converter
     R_AVAILABLE = True
 except ImportError:
     R_AVAILABLE = False
@@ -50,6 +50,8 @@ class GAMTab(BaseTab):
         self.k_duration = tk.IntVar(value=8)
         self.k_time = tk.IntVar(value=15)
         self.k_interaction = tk.IntVar(value=5)
+        self.remove_outliers = tk.BooleanVar(value=False)
+        self.normalize_target = tk.BooleanVar(value=False)
         self.stop_flag = False
         self.model = None
         self.pred_df = None
@@ -63,7 +65,6 @@ class GAMTab(BaseTab):
         main_container = ttk.Frame(self)
         main_container.pack(fill=tk.BOTH, expand=True)
 
-        # Горизонтальный разделитель
         paned = ttk.PanedWindow(main_container, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
 
@@ -72,7 +73,6 @@ class GAMTab(BaseTab):
         paned.add(left_frame, weight=1)
         paned.add(right_frame, weight=4)
 
-        # ========== Левая панель ==========
         info_frame = ttk.LabelFrame(left_frame, text="Описание анализа", padding=5)
         info_frame.pack(fill=tk.X, padx=5, pady=5)
         ttk.Label(info_frame, text="GAM (Глава 2, п. 2.5.6)\nВыявление нелинейных зависимостей γ-мощности\nот длительности события и времени.", justify=tk.LEFT).pack(anchor=tk.W, pady=2)
@@ -94,7 +94,11 @@ class GAMTab(BaseTab):
         cache_frame.pack(fill=tk.X, padx=5, pady=5)
         ttk.Checkbutton(cache_frame, text="Использовать кэш API", variable=self.use_cache).pack(anchor=tk.W)
 
-        # Кнопки в два ряда
+        preproc_frame = ttk.LabelFrame(left_frame, text="Предобработка данных", padding=5)
+        preproc_frame.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Checkbutton(preproc_frame, text="Удалить выбросы (Z-score > 3)", variable=self.remove_outliers).pack(anchor=tk.W)
+        ttk.Checkbutton(preproc_frame, text="Нормализовать γ-мощность (Z-score)", variable=self.normalize_target).pack(anchor=tk.W)
+
         btn_frame1 = ttk.Frame(left_frame)
         btn_frame1.pack(fill=tk.X, padx=5, pady=2)
         self.run_btn = ttk.Button(btn_frame1, text="Запустить GAM", command=self.run_gam)
@@ -115,7 +119,6 @@ class GAMTab(BaseTab):
         self.report_btn = ttk.Button(btn_frame2, text="Сформировать отчёт", command=self.generate_report, state=tk.DISABLED)
         self.report_btn.pack(side=tk.LEFT, padx=2)
 
-        # ========== Правая панель (Notebook) ==========
         self.notebook = ttk.Notebook(right_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
@@ -182,11 +185,16 @@ class GAMTab(BaseTab):
 
     def _run_gam_thread(self):
         try:
+            # ---- 1. УСТАНОВКА ГЛОБАЛЬНОГО КОНВЕРТЕРА В ПОТОКЕ ----
+            from rpy2.robjects import conversion, default_converter
+            conversion.set_conversion(default_converter)
+
+            # ---- 2. ЗАГРУЗКА ДАННЫХ ----
             load_tab = self.main_app.tabs['load']
             api_url = load_tab.api_url.get().rstrip('/')
             token = load_tab.token.get().strip()
             if not api_url or not token:
-                self.log("Ошибка: не указаны URL или токен API. Перейдите на вкладку 'Загрузка и фильтры'.")
+                self.log("Ошибка: не указаны URL или токен API.")
                 return
 
             study_ids = None
@@ -222,69 +230,114 @@ class GAMTab(BaseTab):
             if len(df) > 0:
                 self.log(f"Пример первой записи: {df.iloc[0].to_dict()}")
 
-            # Приводим к числовому типу, удаляем NaN
             df['gamma_power_norm_pct'] = pd.to_numeric(df['gamma_power_norm_pct'], errors='coerce')
             df['time_from_offset'] = pd.to_numeric(df['time_from_offset'], errors='coerce')
 
-            # Проверяем наличие event_duration (может быть None или отсутствовать)
+            # ---- ПРЕДОБРАБОТКА ----
+            if self.remove_outliers.get():
+                z_scores = np.abs((df['gamma_power_norm_pct'] - df['gamma_power_norm_pct'].mean()) / df['gamma_power_norm_pct'].std())
+                before = len(df)
+                df = df[z_scores < 3]
+                self.log(f"Удалено выбросов: {before - len(df)} точек")
+            if self.normalize_target.get():
+                mean = df['gamma_power_norm_pct'].mean()
+                std = df['gamma_power_norm_pct'].std()
+                if std > 0:
+                    df['gamma_power_norm_pct'] = (df['gamma_power_norm_pct'] - mean) / std
+                    self.log(f"Нормализация γ-мощности: mean={mean:.2f}, std={std:.2f}")
+                else:
+                    self.log("Стандартное отклонение равно 0, нормализация не выполнена.")
+
+            # ---- ПРОВЕРКА НАЛИЧИЯ ДЛИТЕЛЬНОСТИ ----
             has_event_duration = 'event_duration' in df.columns and df['event_duration'].notna().any()
             if has_event_duration:
                 df['event_duration'] = pd.to_numeric(df['event_duration'], errors='coerce')
-                # Удаляем строки с NaN в нужных колонках
                 df = df.dropna(subset=['gamma_power_norm_pct', 'event_duration', 'time_from_offset', 'patient_id'])
-                if df.empty:
-                    self.log("Нет данных после очистки (длительность есть, но все строки с NaN).")
-                    return
-                self.log(f"Очищено: {len(df)} точек, пациентов: {df['patient_id'].nunique()}")
-                self.log("Модель будет включать длительность события и взаимодействие.")
-                formula = Formula(f"gamma_power_norm_pct ~ s(event_duration, bs='tp', k={self.k_duration.get()}) + "
-                                  f"s(time_from_offset, bs='tp', k={self.k_time.get()}) + "
-                                  f"ti(event_duration, time_from_offset, bs='tp', k={self.k_interaction.get()}) + "
-                                  f"s(patient_id, bs='re')")
-                use_contour = True
             else:
-                # Упрощённая модель: только время и случайный эффект
                 df = df.dropna(subset=['gamma_power_norm_pct', 'time_from_offset', 'patient_id'])
-                if df.empty:
-                    self.log("Нет данных после очистки (отсутствует event_duration и нет других данных).")
-                    return
-                self.log(f"Очищено: {len(df)} точек, пациентов: {df['patient_id'].nunique()}")
-                self.log("Модель упрощена (без длительности события). Оценивается только временной профиль.")
-                formula = Formula(f"gamma_power_norm_pct ~ s(time_from_offset, bs='tp', k={self.k_time.get()}) + "
-                                  f"s(patient_id, bs='re')")
-                use_contour = False
 
-            # Активируем rpy2
-            pandas2ri.activate()
-            mgcv = importr('mgcv')
-            with localconverter(ro.default_converter + pandas2ri.converter):
+            if df.empty:
+                self.log("Нет данных после удаления пропусков.")
+                return
+
+            n_patients = df['patient_id'].nunique()
+            self.log(f"Очищено: {len(df)} точек, пациентов: {n_patients}")
+            if len(df) < 100:
+                self.log(f"Недостаточно данных (n={len(df)}). Анализ остановлен.")
+                return
+
+            # ---- АВТОМАТИЧЕСКАЯ КОРРЕКТИРОВКА k ДЛЯ ВРЕМЕНИ ----
+            n_unique_time = df['time_from_offset'].nunique()
+            k_time_user = self.k_time.get()
+            k_time_actual = min(k_time_user, n_unique_time - 1) if n_unique_time > 1 else 2
+            if k_time_actual < k_time_user:
+                self.log(f"Уменьшено k для time: {k_time_user} -> {k_time_actual} (уникальных значений времени: {n_unique_time})")
+
+            # ---- ПОСТРОЕНИЕ ФОРМУЛЫ ----
+            use_re = n_patients > 1
+            if has_event_duration:
+                formula_str = (f"gamma_power_norm_pct ~ s(event_duration, bs='tp', k={self.k_duration.get()}) + "
+                               f"s(time_from_offset, bs='tp', k={k_time_actual}) + "
+                               f"ti(event_duration, time_from_offset, bs='tp', k={self.k_interaction.get()})")
+                if use_re:
+                    formula_str += " + s(patient_id, bs='re')"
+                use_contour = True
+                self.log("Модель включает длительность события и взаимодействие.")
+            else:
+                formula_str = f"gamma_power_norm_pct ~ s(time_from_offset, bs='tp', k={k_time_actual})"
+                if use_re:
+                    formula_str += " + s(patient_id, bs='re')"
+                use_contour = False
+                self.log("Модель упрощена (без длительности события).")
+
+            formula = Formula(formula_str)
+            self.log(f"Формула: {formula_str}")
+
+            # ---- ПРЕОБРАЗОВАНИЕ DF В R ----
+            from rpy2.robjects import pandas2ri, numpy2ri
+            with conversion.localconverter(default_converter + pandas2ri.converter + numpy2ri.converter):
                 r_df = ro.conversion.py2rpy(df)
 
-            self.log("Оценка GAM-модели (REML)...")
+            # ---- ОБУЧЕНИЕ МОДЕЛИ ----
+            mgcv = importr('mgcv')
             model = mgcv.gam(formula, data=r_df, method="REML")
             self.model = model
 
-            # Summary
-            summary_rs = ro.r.summary(model)
-            summary_cap = ro.r.capture_output(ro.r.print(summary_rs))
-            summary_str = "\n".join([str(line) for line in summary_cap])
-            self.summary_text.insert(tk.END, summary_str)
-            self.log("Модель обучена.")
+            # ---- SUMMARY И ГЛАДКИЕ ЧЛЕНЫ ----
+            with conversion.localconverter(default_converter):
+                summary_r = ro.r.summary(model)
+                capture_out = getattr(ro.r, 'capture.output')
+                summary_lines = capture_out(summary_r)
+                summary_str = "\n".join(list(summary_lines))
+                self.summary_text.insert(tk.END, summary_str)
+                self.log("Модель обучена.")
 
-            # Гладкие члены
-            self._extract_smooth_params(model)
+                s_table = summary_r.rx2('s.table')
+                s_table_df = ro.r['as.data.frame'](s_table)
 
-            # Предсказания
+            with conversion.localconverter(default_converter + pandas2ri.converter + numpy2ri.converter):
+                smooth_df = ro.conversion.rpy2py(s_table_df)
+
+            if smooth_df is not None and not smooth_df.empty:
+                smooth_df.columns = ['edf', 'ref_df', 'F', 'p_value']
+                smooth_df['nonlinear'] = (smooth_df['edf'] > 1.5) & (smooth_df['p_value'] < 0.05)
+                self.results_smooth = smooth_df
+                self.log("=== Гладкие члены GAM ===")
+                for idx, row in smooth_df.iterrows():
+                    self.log(f"{idx}: edf={row['edf']:.2f}, p={row['p_value']:.4e}, нелинейность={'Да' if row['nonlinear'] else 'Нет'}")
+
+            # ---- ПРЕДСКАЗАНИЯ ----
             pred = mgcv.predict_gam(model)
+            with conversion.localconverter(default_converter + numpy2ri.converter):
+                pred_vals = ro.conversion.rpy2py(pred)
             self.pred_df = df.copy()
-            with localconverter(ro.default_converter + pandas2ri.converter):
-                self.pred_df['predicted'] = ro.conversion.rpy2py(pred)
+            self.pred_df['predicted'] = pred_vals
 
-            # Построение графиков
-            if use_contour:
+            # ---- ГРАФИКИ ----
+            self.log("Построение контурного графика...")
+            if use_contour and has_event_duration:
                 self._plot_contour(df, model)
             else:
-                # Если нет event_duration, контурный график не строим (показываем сообщение)
                 for widget in self.plot_frame.winfo_children():
                     widget.destroy()
                 fig = Figure(figsize=(10, 6), dpi=100)
@@ -296,7 +349,9 @@ class GAMTab(BaseTab):
                 canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
                 self.current_figure = fig
 
-            self._plot_partial_dependencies(model, df, use_contour)
+            self.log("Построение частичной зависимости...")
+            self._plot_partial_dependencies(model, df, has_event_duration)
+            self.log("Построение графика остатков...")
             self._plot_residuals(model, df)
 
             for btn in (self.save_csv_btn, self.save_plot_btn, self.save_model_btn, self.save_summary_btn, self.report_btn):
@@ -311,21 +366,6 @@ class GAMTab(BaseTab):
             self.stop_btn.config(state=tk.DISABLED)
             self.main_app.set_progress(0)
 
-    def _extract_smooth_params(self, model):
-        try:
-            s_table = ro.r('as.data.frame(summary(model)$s.table)')
-            with localconverter(ro.default_converter + pandas2ri.converter):
-                smooth_df = ro.conversion.rpy2py(s_table)
-            if smooth_df is not None and not smooth_df.empty:
-                smooth_df.columns = ['edf', 'ref_df', 'F', 'p_value']
-                smooth_df['nonlinear'] = (smooth_df['edf'] > 1.5) & (smooth_df['p_value'] < 0.05)
-                self.results_smooth = smooth_df
-                self.log("=== Гладкие члены GAM ===")
-                for idx, row in smooth_df.iterrows():
-                    self.log(f"{idx}: edf={row['edf']:.2f}, p={row['p_value']:.4e}, нелинейность={'Да' if row['nonlinear'] else 'Нет'}")
-        except Exception as e:
-            self.log(f"Не удалось извлечь параметры гладких членов: {e}")
-
     def _plot_contour(self, df, model):
         duration_vals = np.linspace(df['event_duration'].min(), df['event_duration'].max(), 50)
         time_vals = np.linspace(self.time_min.get(), self.time_max.get(), 50)
@@ -335,17 +375,19 @@ class GAMTab(BaseTab):
             'time_from_offset': grid_time.ravel(),
             'patient_id': df['patient_id'].iloc[0]
         })
-        with localconverter(ro.default_converter + pandas2ri.converter):
+        from rpy2.robjects import conversion, default_converter
+        from rpy2.robjects import pandas2ri, numpy2ri
+        with conversion.localconverter(default_converter + pandas2ri.converter + numpy2ri.converter):
             r_grid = ro.conversion.py2rpy(grid_df)
         pred_grid = ro.r.predict(model, newdata=r_grid, type="response")
-        with localconverter(ro.default_converter + pandas2ri.converter):
-            pred_vals = ro.conversion.rpy2py(pred_grid)
-        pred_vals = pred_vals.reshape(grid_dur.shape)
+        with conversion.localconverter(default_converter + numpy2ri.converter):
+            pred_vals = ro.conversion.rpy2py(pred_grid).reshape(grid_dur.shape)
 
         fig = Figure(figsize=(10, 8), dpi=100)
         ax = fig.add_subplot(111)
         contour = ax.contourf(grid_dur, grid_time, pred_vals, levels=20, cmap='coolwarm')
-        ax.scatter(df['event_duration'], df['time_from_offset'], c=df['gamma_power_norm_pct'], s=5, alpha=0.3, cmap='coolwarm', edgecolors='none')
+        ax.scatter(df['event_duration'], df['time_from_offset'], c=df['gamma_power_norm_pct'],
+                   s=5, alpha=0.3, cmap='coolwarm', edgecolors='none')
         ax.set_xlabel('Длительность события (сек)')
         ax.set_ylabel('Время относительно offset (сек)')
         ax.set_title('Предсказанная нормализованная γ-мощность (%)')
@@ -358,23 +400,27 @@ class GAMTab(BaseTab):
         self.current_figure = fig
 
     def _plot_partial_dependencies(self, model, df, has_duration=False):
-        # Частичная зависимость только для time (так как время есть всегда)
+        """Оптимизированная версия: один вызов predict."""
         time_vals = np.linspace(self.time_min.get(), self.time_max.get(), 100)
-        pred_time = []
-        for t in time_vals:
-            temp_df = df.copy()
-            temp_df['time_from_offset'] = t
-            if has_duration:
-                temp_df['event_duration'] = df['event_duration'].median()
-            with localconverter(ro.default_converter + pandas2ri.converter):
-                r_temp = ro.conversion.py2rpy(temp_df)
-            pred = ro.r.predict(model, newdata=r_temp, type="response")
-            with localconverter(ro.default_converter + pandas2ri.converter):
-                pred_time.append(np.mean(ro.conversion.rpy2py(pred)))
+        temp_df = pd.DataFrame({
+            'time_from_offset': time_vals,
+            'patient_id': [df['patient_id'].iloc[0]] * len(time_vals)
+        })
+        if has_duration:
+            median_duration = df['event_duration'].median()
+            temp_df['event_duration'] = median_duration
+
+        from rpy2.robjects import conversion, default_converter
+        from rpy2.robjects import pandas2ri, numpy2ri
+        with conversion.localconverter(default_converter + pandas2ri.converter + numpy2ri.converter):
+            r_temp = ro.conversion.py2rpy(temp_df)
+        pred_all = ro.r.predict(model, newdata=r_temp, type="response")
+        with conversion.localconverter(default_converter + numpy2ri.converter):
+            pred_vals = ro.conversion.rpy2py(pred_all)
 
         fig = Figure(figsize=(8, 6), dpi=100)
         ax = fig.add_subplot(111)
-        ax.plot(time_vals, pred_time, 'b-', linewidth=2)
+        ax.plot(time_vals, pred_vals, 'b-', linewidth=2)
         ax.set_xlabel('Время относительно offset (сек)')
         ax.set_ylabel('Предсказанная γ-мощность (%)')
         ax.set_title('Частичная зависимость: time')
@@ -386,13 +432,13 @@ class GAMTab(BaseTab):
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
     def _plot_residuals(self, model, df):
-        with localconverter(ro.default_converter + pandas2ri.converter):
-            r_df = ro.conversion.py2rpy(df)
         pred_all = ro.r.predict(model, type="response")
-        resid_all = df['gamma_power_norm_pct'].values - np.array(pred_all).flatten()
+        with conversion.localconverter(default_converter + numpy2ri.converter):
+            pred_array = np.array(ro.conversion.rpy2py(pred_all)).flatten()
+        resid_all = df['gamma_power_norm_pct'].values - pred_array
         fig = Figure(figsize=(8, 6), dpi=100)
         ax = fig.add_subplot(111)
-        ax.scatter(pred_all, resid_all, alpha=0.3, s=5)
+        ax.scatter(pred_array, resid_all, alpha=0.3, s=5)
         ax.axhline(y=0, color='r', linestyle='--')
         ax.set_xlabel('Предсказанные значения')
         ax.set_ylabel('Остатки')
@@ -452,7 +498,9 @@ class GAMTab(BaseTab):
             messagebox.showwarning("Нет данных", "Сначала выполните GAM.")
             return
 
-        # Сохраняем текущий контурный график (если есть)
+        has_duration = 'event_duration' in self.pred_df.columns
+        model_type = "полная (с длительностью события и взаимодействием)" if has_duration else "упрощённая (только временной профиль)"
+
         img_base64 = ""
         if self.current_figure is not None and self.current_figure.get_axes():
             buf = io.BytesIO()
@@ -461,37 +509,52 @@ class GAMTab(BaseTab):
             img_base64 = base64.b64encode(buf.read()).decode('utf-8')
         plot_html = f'<div class="plot"><img src="data:image/png;base64,{img_base64}" style="max-width:100%;"/></div>' if img_base64 else "<p>Контурный график недоступен (нет данных о длительности события).</p>"
 
-        # Таблица гладких членов
         smooth_html = ""
         if self.results_smooth is not None:
             smooth_html = self.results_smooth.to_html(float_format="%.4f")
         else:
             smooth_html = "<p>Не удалось извлечь параметры гладких членов.</p>"
 
-        # Интерпретация гипотезы H3 (фазическая)
-        hyp_html = "<h3>Проверка гипотезы H3 (фазическая)</h3>"
-        hyp_html += "<p><strong>Гипотеза:</strong> абсолютная гамма‑мощность (30–45 Гц) и индекс реактивности бета в пост‑событийном окне (0–10 с) значимо выше в эпохах с апноэ/гипопноэ по сравнению с фоновыми эпохами, а также коррелируют с длительностью события и AHI.</p>"
-        if self.results_smooth is not None:
-            # Определяем, есть ли значимая нелинейность для s(event_duration) или s(time_from_offset)
-            time_nonlinear = False
-            dur_nonlinear = False
-            for idx, row in self.results_smooth.iterrows():
-                if 'time_from_offset' in idx and row['nonlinear']:
-                    time_nonlinear = True
-                if 'event_duration' in idx and row['nonlinear']:
-                    dur_nonlinear = True
-            if time_nonlinear:
-                hyp_html += "<p><strong>Вывод:</strong> Обнаружена значимая нелинейная динамика γ-мощности относительно времени окончания события (p < 0.05, edf > 1.5). Это подтверждает наличие острого пика γ-активности после апноэ. Таким образом, <span style='color:green;'>H3 ПОДТВЕРЖДАЕТСЯ</span> для временной динамики.</p>"
-            else:
-                hyp_html += "<p><strong>Вывод:</strong> Нелинейные эффекты времени не достигли статистической значимости. Возможно, требуются дополнительные данные.</p>"
-            if dur_nonlinear:
-                hyp_html += "<p>Дополнительно: выявлена значимая нелинейная связь между длительностью события и γ-мощностью, что усиливает подтверждение H3.</p>"
-        else:
-            hyp_html += "<p>Не удалось оценить нелинейность – проверьте модель.</p>"
+        hyp_html = "<h2>Проверка гипотезы H3 (фазическая, нелинейный анализ)</h2>"
+        hyp_html += "<p><strong>Гипотеза (Глава 2, п.2.1.1):</strong> абсолютная гамма‑мощность (30–45 Гц) и индекс реактивности бета в пост‑событийном окне (0–10 с) значимо выше в эпохах с апноэ/гипопноэ по сравнению с фоновыми эпохами, а также коррелируют с длительностью события и AHI.</p>"
+        hyp_html += f"<p><strong>Модель:</strong> {model_type}. Оценка выполнена на канале {self.channel.get()} в интервале [{self.time_min.get()}, {self.time_max.get()}] с.</p>"
 
-        # Общая интерпретация
-        interp_html = "<h3>Интерпретация GAM</h3>"
+        if self.results_smooth is not None:
+            time_row = None
+            dur_row = None
+            for idx, row in self.results_smooth.iterrows():
+                if 'time_from_offset' in idx:
+                    time_row = row
+                if 'event_duration' in idx:
+                    dur_row = row
+
+            time_nonlinear = time_row is not None and time_row['nonlinear']
+            dur_nonlinear = dur_row is not None and dur_row['nonlinear']
+
+            hyp_html += "<h3>Результаты оценки нелинейности</h3><ul>"
+            if time_nonlinear:
+                hyp_html += f"<li>✅ <strong>Временной профиль γ-мощности значимо нелинеен</strong> (edf = {time_row['edf']:.2f} > 1.5, p = {time_row['p_value']:.4e}). Это подтверждает наличие острого пика после окончания события, что соответствует H3.</li>"
+            else:
+                hyp_html += f"<li>❌ <strong>Временной профиль не показал значимой нелинейности</strong> (edf = {time_row['edf']:.2f}, p = {time_row['p_value']:.4e}). Возможно, эффект линейный или требуются дополнительные данные.</li>"
+            if has_duration and dur_row is not None:
+                if dur_nonlinear:
+                    hyp_html += f"<li>✅ <strong>Зависимость γ-мощности от длительности события значимо нелинейна</strong> (edf = {dur_row['edf']:.2f} > 1.5, p = {dur_row['p_value']:.4e}). Это указывает на то, что более длительные апноэ вызывают непропорционально сильный γ-ответ, что усиливает подтверждение H3.</li>"
+                else:
+                    hyp_html += f"<li>⚠️ <strong>Зависимость от длительности события не является значимо нелинейной</strong> (edf = {dur_row['edf']:.2f}, p = {dur_row['p_value']:.4e}).</li>"
+            hyp_html += "</ul>"
+
+            if time_nonlinear:
+                hyp_html += "<p><strong>Вывод:</strong> <span style='color:green;'>H3 ПОДТВЕРЖДАЕТСЯ</span> – обнаружена значимая нелинейная динамика γ-активности после респираторных событий, что свидетельствует об острой корковой активации (микропробуждении).</p>"
+            else:
+                hyp_html += "<p><strong>Вывод:</strong> <span style='color:orange;'>H3 НЕ ПОДТВЕРЖДЕНА</span> в отношении нелинейности временного профиля. Однако это не исключает наличия линейного эффекта.</p>"
+            if has_duration and dur_nonlinear:
+                hyp_html += "<p>Дополнительно: выявлена нелинейная связь с длительностью события, что усиливает нейрофизиологическую интерпретацию.</p>"
+        else:
+            hyp_html += "<p>Не удалось извлечь параметры гладких членов – проверьте выводы summary модели.</p>"
+
+        interp_html = "<h3>Интерпретация GAM (п.2.5.6)</h3>"
         interp_html += "<p>GAM позволяет выявить нелинейные зависимости между нормализованной гамма-мощностью и временем относительно offset. Эффективные степени свободы (edf) > 1.5 указывают на нелинейность. Значимость гладких членов оценивается по p-значению (F-тест).</p>"
+        interp_html += "<p>Полученные результаты интерпретируются в контексте гипотезы H3: пик γ-активности после апноэ отражает активацию коры (микропробуждение), а нелинейная связь с длительностью события указывает на дозозависимый эффект гипоксемии/гиперкапнии.</p>"
 
         html = f"""
         <!DOCTYPE html>
@@ -512,6 +575,7 @@ class GAMTab(BaseTab):
         <p><strong>Интервал времени:</strong> {self.time_min.get()} … {self.time_max.get()} с</p>
         <p><strong>Число базисных функций:</strong> k(time)={self.k_time.get()}</p>
         <p><strong>Использованы отфильтрованные исследования:</strong> {'Да' if self.use_filtered.get() else 'Нет'}</p>
+        <p><strong>Тип модели:</strong> {model_type}</p>
 
         {hyp_html}
         {interp_html}
@@ -523,6 +587,7 @@ class GAMTab(BaseTab):
         {smooth_html}
 
         <p><em>Примечание:</em> Значимая нелинейность: edf > 1.5 и p < 0.05.</p>
+        <p><em>Связь с гипотезами:</em> Проверка H3 (фазическая) выполнена. Для проверки H1, H2, H4 используются LMM (вкладка 'LMM анализ') и event‑locked анализ (вкладка 'Event‑locked анализ').</p>
         </body>
         </html>
         """
